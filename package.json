@@ -4,10 +4,19 @@
   "private": true,
   "type": "module",
   "description": "Branch-aware, context-efficient Pi session inspection tool and Agent Skill",
-  "keywords": ["pi-package", "pi", "session", "agent-skill"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "session",
+    "agent-skill"
+  ],
   "pi": {
-    "extensions": ["./extensions"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

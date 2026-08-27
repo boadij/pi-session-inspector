@@ -14,7 +14,8 @@ const HARD_OUTPUT_CHARS = 30_000;
 
 type AnyEntry = Record<string, any>;
 type Scope = "branch" | "all" | "context";
-type Action = "summary" | "timeline" | "tools" | "errors" | "search" | "branches" | "entry";
+type Action =
+  "summary" | "timeline" | "tools" | "errors" | "search" | "branches" | "entry";
 
 function expandPath(input: string): string {
   if (input === "~") return homedir();
@@ -43,7 +44,10 @@ function redact(text: string): string {
     .replace(/\b(gh[pousr]_[A-Za-z0-9]{20,})\b/g, "[REDACTED_GITHUB_TOKEN]")
     .replace(/\b(AKIA[A-Z0-9]{16})\b/g, "[REDACTED_AWS_KEY]")
     .replace(/(authorization\s*:\s*bearer\s+)[^\s,;]+/gi, "$1[REDACTED]")
-    .replace(/((?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+    .replace(
+      /((?:api[_-]?key|access[_-]?token|auth[_-]?token|secret|password)\s*[=:]\s*)[^\s,;]+/gi,
+      "$1[REDACTED]",
+    );
 }
 
 function safeJson(value: unknown, maxChars: number): string {
@@ -51,7 +55,8 @@ function safeJson(value: unknown, maxChars: number): string {
   let text: string;
   try {
     text = JSON.stringify(value, (_key, v) => {
-      if (typeof v === "string" && v.length > maxChars * 2) return clip(v, maxChars * 2);
+      if (typeof v === "string" && v.length > maxChars * 2)
+        return clip(v, maxChars * 2);
       if (v && typeof v === "object") {
         if (seen.has(v)) return "[Circular]";
         seen.add(v);
@@ -79,7 +84,12 @@ function textFromContent(content: unknown, maxChars: number): string {
 }
 
 function toolCallsFromMessage(message: any, maxChars: number) {
-  if (!message || message.role !== "assistant" || !Array.isArray(message.content)) return [];
+  if (
+    !message ||
+    message.role !== "assistant" ||
+    !Array.isArray(message.content)
+  )
+    return [];
   const calls: Array<{ id?: string; name?: string; arguments?: string }> = [];
   for (const block of message.content) {
     if (!block || block.type !== "toolCall") continue;
@@ -94,7 +104,11 @@ function toolCallsFromMessage(message: any, maxChars: number) {
 }
 
 function isInspectorResult(entry: AnyEntry): boolean {
-  return entry?.type === "message" && entry?.message?.role === "toolResult" && entry?.message?.toolName === TOOL_NAME;
+  return (
+    entry?.type === "message" &&
+    entry?.message?.role === "toolResult" &&
+    entry?.message?.toolName === TOOL_NAME
+  );
 }
 
 function getEntriesForScope(manager: any, scope: Scope): AnyEntry[] {
@@ -125,9 +139,15 @@ function messageRecord(entry: AnyEntry, maxChars: number) {
       ts: iso(m.timestamp ?? entry.timestamp),
       role: "assistant",
       text: textFromContent(m.content, maxChars),
-      ...(calls.length ? { tools: calls.map((c) => c.name).filter(Boolean) } : {}),
-      ...(m.stopReason && m.stopReason !== "stop" && m.stopReason !== "toolUse" ? { stopReason: m.stopReason } : {}),
-      ...(m.errorMessage ? { error: clip(redact(String(m.errorMessage)), maxChars) } : {}),
+      ...(calls.length
+        ? { tools: calls.map((c) => c.name).filter(Boolean) }
+        : {}),
+      ...(m.stopReason && m.stopReason !== "stop" && m.stopReason !== "toolUse"
+        ? { stopReason: m.stopReason }
+        : {}),
+      ...(m.errorMessage
+        ? { error: clip(redact(String(m.errorMessage)), maxChars) }
+        : {}),
     };
   }
 
@@ -154,8 +174,17 @@ function messageRecord(entry: AnyEntry, maxChars: number) {
   };
 }
 
-function compactEntry(entry: AnyEntry, maxChars: number): Record<string, unknown> {
-  if (entry.type === "message") return messageRecord(entry, maxChars) ?? { id: entry.id, type: "inspector_result_omitted" };
+function compactEntry(
+  entry: AnyEntry,
+  maxChars: number,
+): Record<string, unknown> {
+  if (entry.type === "message")
+    return (
+      messageRecord(entry, maxChars) ?? {
+        id: entry.id,
+        type: "inspector_result_omitted",
+      }
+    );
 
   const base: Record<string, unknown> = {
     id: entry.id,
@@ -181,7 +210,8 @@ function compactEntry(entry: AnyEntry, maxChars: number): Record<string, unknown
     base.name = entry.name;
   } else if (entry.type === "custom" || entry.type === "custom_message") {
     base.customType = entry.customType;
-    if (entry.content) base.content = clip(redact(String(entry.content)), maxChars);
+    if (entry.content)
+      base.content = clip(redact(String(entry.content)), maxChars);
   }
 
   return base;
@@ -239,8 +269,11 @@ function summarize(manager: any, entries: AnyEntry[]) {
 
   const all = manager.getEntries() as AnyEntry[];
   const parentIds = new Set<string>();
-  for (const e of all) if (typeof e.parentId === "string") parentIds.add(e.parentId);
-  const leaves = all.filter((e) => typeof e.id === "string" && !parentIds.has(e.id));
+  for (const e of all)
+    if (typeof e.parentId === "string") parentIds.add(e.parentId);
+  const leaves = all.filter(
+    (e) => typeof e.id === "string" && !parentIds.has(e.id),
+  );
 
   return {
     session: {
@@ -319,13 +352,21 @@ function errorRecords(entries: AnyEntry[], maxChars: number) {
         error: textFromContent(m.content, maxChars),
       });
     }
-    if (m?.role === "assistant" && (m.stopReason === "error" || m.errorMessage)) {
+    if (
+      m?.role === "assistant" &&
+      (m.stopReason === "error" || m.errorMessage)
+    ) {
       records.push({
         entryId: entry.id,
         ts: iso(m.timestamp ?? entry.timestamp),
         kind: "assistant",
         stopReason: m.stopReason,
-        error: clip(redact(String(m.errorMessage ?? textFromContent(m.content, maxChars))), maxChars),
+        error: clip(
+          redact(
+            String(m.errorMessage ?? textFromContent(m.content, maxChars)),
+          ),
+          maxChars,
+        ),
       });
     }
   }
@@ -372,8 +413,12 @@ function branchRecords(manager: any, maxChars: number) {
     if (typeof e.id === "string") byId.set(e.id, e);
     if (typeof e.parentId === "string") parentIds.add(e.parentId);
   }
-  const activeIds = new Set((manager.getBranch() as AnyEntry[]).map((e) => e.id));
-  const leaves = entries.filter((e) => typeof e.id === "string" && !parentIds.has(e.id));
+  const activeIds = new Set(
+    (manager.getBranch() as AnyEntry[]).map((e) => e.id),
+  );
+  const leaves = entries.filter(
+    (e) => typeof e.id === "string" && !parentIds.has(e.id),
+  );
 
   function pathToRoot(leaf: AnyEntry) {
     const path: AnyEntry[] = [];
@@ -382,26 +427,35 @@ function branchRecords(manager: any, maxChars: number) {
     while (current && typeof current.id === "string" && !seen.has(current.id)) {
       seen.add(current.id);
       path.push(current);
-      current = typeof current.parentId === "string" ? byId.get(current.parentId) : undefined;
+      current =
+        typeof current.parentId === "string"
+          ? byId.get(current.parentId)
+          : undefined;
     }
     return path.reverse();
   }
 
   return leaves.map((leaf) => {
     const path = pathToRoot(leaf);
-    const lastMessage = [...path].reverse().find((e) => e.type === "message" && !isInspectorResult(e));
+    const lastMessage = [...path]
+      .reverse()
+      .find((e) => e.type === "message" && !isInspectorResult(e));
     return {
       leafId: leaf.id,
       active: activeIds.has(leaf.id),
       depth: path.length,
-      last: lastMessage ? messageRecord(lastMessage, maxChars) : compactEntry(leaf, maxChars),
+      last: lastMessage
+        ? messageRecord(lastMessage, maxChars)
+        : compactEntry(leaf, maxChars),
     };
   });
 }
 
 function takeWindow<T>(records: T[], limit: number, fromEnd = true): T[] {
   if (records.length <= limit) return records;
-  return fromEnd ? records.slice(records.length - limit) : records.slice(0, limit);
+  return fromEnd
+    ? records.slice(records.length - limit)
+    : records.slice(0, limit);
 }
 
 function fitOutput(payload: any): string {
@@ -409,8 +463,17 @@ function fitOutput(payload: any): string {
   if (text.length <= HARD_OUTPUT_CHARS) return text;
 
   if (Array.isArray(payload.records)) {
-    const copy = { ...payload, truncated: true, totalRecords: payload.records.length, records: [...payload.records] };
-    while (copy.records.length > 1 && JSON.stringify(copy).length > HARD_OUTPUT_CHARS) copy.records.pop();
+    const copy = {
+      ...payload,
+      truncated: true,
+      totalRecords: payload.records.length,
+      records: [...payload.records],
+    };
+    while (
+      copy.records.length > 1 &&
+      JSON.stringify(copy).length > HARD_OUTPUT_CHARS
+    )
+      copy.records.pop();
     text = JSON.stringify(copy);
     if (text.length <= HARD_OUTPUT_CHARS) return text;
   }
@@ -427,31 +490,63 @@ export default function sessionInspector(pi: ExtensionAPI) {
     label: "Session Inspect",
     description:
       "Efficiently inspect and analyze the current Pi session, or an explicitly specified Pi session file, without dumping raw JSONL. Returns bounded structured evidence for summaries, timelines, tools, errors, searches, branches, or individual entries.",
-    promptSnippet: "Inspect Pi sessions with bounded, branch-aware structured output",
+    promptSnippet:
+      "Inspect Pi sessions with bounded, branch-aware structured output",
     promptGuidelines: [
       "Use session_inspect instead of reading raw Pi session JSONL when investigating session history, tool usage, failures, branches, compaction, or agent behavior.",
       "For session analysis, call session_inspect with action=summary first, then request only targeted evidence with errors, tools, search, timeline, branches, or entry.",
       "Prefer scope=branch for causal analysis of the active path; use scope=all only when abandoned branches matter.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["summary", "timeline", "tools", "errors", "search", "branches", "entry"] as const, {
-        description: "Inspection operation. Start with summary for analysis tasks.",
-      }),
+      action: StringEnum(
+        [
+          "summary",
+          "timeline",
+          "tools",
+          "errors",
+          "search",
+          "branches",
+          "entry",
+        ] as const,
+        {
+          description:
+            "Inspection operation. Start with summary for analysis tasks.",
+        },
+      ),
       scope: Type.Optional(
         StringEnum(["branch", "all", "context"] as const, {
-          description: "branch=current path, all=entire session tree, context=active branch after compaction rules. Default branch.",
+          description:
+            "branch=current path, all=entire session tree, context=active branch after compaction rules. Default branch.",
         }),
       ),
       session: Type.Optional(
         Type.String({
-          description: "Optional explicit .jsonl session path. Omit to inspect the active session via ctx.sessionManager.",
+          description:
+            "Optional explicit .jsonl session path. Omit to inspect the active session via ctx.sessionManager.",
         }),
       ),
-      query: Type.Optional(Type.String({ description: "Case-insensitive substring for action=search." })),
-      entryId: Type.Optional(Type.String({ description: "Exact entry ID for action=entry." })),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Maximum returned records. Default 20." })),
+      query: Type.Optional(
+        Type.String({
+          description: "Case-insensitive substring for action=search.",
+        }),
+      ),
+      entryId: Type.Optional(
+        Type.String({ description: "Exact entry ID for action=entry." }),
+      ),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 50,
+          description: "Maximum returned records. Default 20.",
+        }),
+      ),
       maxChars: Type.Optional(
-        Type.Integer({ minimum: 120, maximum: 2000, description: "Maximum characters per text/args/result snippet. Default 700." }),
+        Type.Integer({
+          minimum: 120,
+          maximum: 2000,
+          description:
+            "Maximum characters per text/args/result snippet. Default 700.",
+        }),
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -466,7 +561,14 @@ export default function sessionInspector(pi: ExtensionAPI) {
         const path = expandPath(params.session);
         if (!path.endsWith(".jsonl")) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ error: "session must point to a .jsonl Pi session file" }) }],
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  error: "session must point to a .jsonl Pi session file",
+                }),
+              },
+            ],
             details: { action, scope, ok: false },
           };
         }
@@ -474,7 +576,9 @@ export default function sessionInspector(pi: ExtensionAPI) {
         source = path;
       }
 
-      const entries = getEntriesForScope(manager, scope).filter((e) => !isInspectorResult(e));
+      const entries = getEntriesForScope(manager, scope).filter(
+        (e) => !isInspectorResult(e),
+      );
       let payload: any;
 
       switch (action) {
@@ -483,7 +587,9 @@ export default function sessionInspector(pi: ExtensionAPI) {
           break;
 
         case "timeline": {
-          const records = entries.map((e) => compactEntry(e, maxChars)).filter((e) => e.type !== "inspector_result_omitted");
+          const records = entries
+            .map((e) => compactEntry(e, maxChars))
+            .filter((e) => e.type !== "inspector_result_omitted");
           payload = {
             action,
             scope,
