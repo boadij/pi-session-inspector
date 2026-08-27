@@ -1,0 +1,17 @@
+{
+  "name": "pi-session-inspector-tool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Branch-aware, context-efficient Pi session inspection tool and Agent Skill",
+  "keywords": ["pi-package", "pi", "session", "agent-skill"],
+  "pi": {
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
