@@ -1,32 +1,16 @@
-# Pi Session Inspector Tool
+# Pi Session Inspector
 
-A native Pi extension plus Agent Skill for efficient session inspection by the active coding agent.
+`pi-session-inspector` adds one model-callable Pi extension tool, `session_inspect`, for bounded, branch-aware inspection of the active session or an explicitly supplied historical `.jsonl` session.
 
-## Why this shape
-
-The extension registers one LLM-callable tool, `session_inspect`, and reads the active session directly from Pi's `ctx.sessionManager`. The skill teaches agents to start with a cheap summary and pull only the evidence needed for analysis.
-
-It intentionally avoids dumping raw session JSONL, thinking blocks, images, and unbounded tool output into model context.
-
-## Install locally
-
-From the extracted directory:
+## Install
 
 ```bash
-pi install /absolute/path/to/pi-session-inspector-v2
+pi install /absolute/path/to/pi-session-inspector
 ```
 
-Alternatively copy the resources manually:
+Reload Pi after installing.
 
-```bash
-mkdir -p ~/.pi/agent/extensions ~/.pi/agent/skills/session-inspector
-cp extensions/session-inspector.ts ~/.pi/agent/extensions/session-inspector.ts
-cp skills/session-inspector/SKILL.md ~/.pi/agent/skills/session-inspector/SKILL.md
-```
-
-Then run `/reload` in Pi.
-
-## Tool
+## Actions
 
 `session_inspect` supports:
 
@@ -44,7 +28,7 @@ Scopes:
 - `all` - entire session tree
 - `context` - active branch after Pi's context/compaction rules
 
-By default the tool inspects the active session. `session` may point explicitly to another Pi `.jsonl` session file.
+By default the tool inspects the active session. `session` may point explicitly to another Pi `.jsonl` session file; historical files are parsed and migrated in memory and are never rewritten.
 
 ## Typical agent workflow
 
@@ -55,4 +39,4 @@ session_inspect(action="search", query="src/auth.ts", limit=10)
 session_inspect(action="entry", entryId="...")
 ```
 
-The extension filters its own `session_inspect` calls/results from most analysis so repeated inspection does not pollute the session metrics.
+The tool excludes its own `session_inspect` calls from tool-call statistics and its tool results from tool-result statistics; the assistant messages and usage that produced them remain normal session data. Output is bounded, redacted, and omits thinking blocks and image payloads.
