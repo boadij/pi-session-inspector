@@ -251,9 +251,15 @@ test("inspects typed timestamps, evidence, usage, branches, and bounded tails", 
     content: [{ type: "text", text: `${index} ${"z".repeat(2_000)}` }],
     timestamp: 1_700_000_100_000 + index,
   }))];
-  const bounded = output(await definition.execute("7", { action: "timeline", scope: "all", limit: 50, maxChars: 2_000 }, undefined, undefined, { sessionManager: manager(many, branch, tree) } as unknown as ExtensionContext));
+  const boundedResult = await definition.execute("7", { action: "timeline", scope: "all", limit: 50, maxChars: 2_000 }, undefined, undefined, { sessionManager: manager(many, branch, tree) } as unknown as ExtensionContext);
+  const bounded = output(boundedResult);
   assert.equal(bounded.total, many.length - 1);
   assert.equal(bounded.truncated, true);
+  assert.equal((boundedResult.details as { returned: number }).returned, bounded.returned);
+  assert.match(
+    renderResult(boundedResult, { expanded: false, isPartial: false }, theme, {} as never).render(200).join("\n"),
+    new RegExp(`✓ ${bounded.total} timeline entries · ${bounded.returned} shown`),
+  );
   assert.equal(bounded.records.at(-1).id, "tail-29");
   assert.equal(bounded.records.some((record: { id: string }) => record.id === "tail-0"), false);
   const limitedResult = await definition.execute("7b", { action: "timeline", scope: "all", limit: 1 }, undefined, undefined, { sessionManager: manager(many, branch, tree) } as unknown as ExtensionContext);

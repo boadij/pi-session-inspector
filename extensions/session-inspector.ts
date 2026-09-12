@@ -640,13 +640,13 @@ function recordsPayload(base: Record<string, unknown>, records: unknown[], limit
   };
 }
 
-function fitOutput(payload: Record<string, unknown>): string {
+function fitPayload(payload: Record<string, unknown>): Record<string, unknown> {
   const records = Array.isArray(payload.records) ? [...payload.records] : undefined;
   if (!records) {
     const text = JSON.stringify(payload);
     return text.length <= HARD_OUTPUT_CHARS
-      ? text
-      : JSON.stringify({ truncated: true, note: `Output exceeded ${HARD_OUTPUT_CHARS} characters.` });
+      ? payload
+      : { truncated: true, note: `Output exceeded ${HARD_OUTPUT_CHARS} characters.` };
   }
 
   const total = typeof payload.total === "number" ? payload.total : records.length;
@@ -661,8 +661,8 @@ function fitOutput(payload: Record<string, unknown>): string {
   copy.total = total;
   copy.truncated = records.length < total;
   const text = JSON.stringify(copy);
-  if (text.length <= HARD_OUTPUT_CHARS) return text;
-  return JSON.stringify({
+  if (text.length <= HARD_OUTPUT_CHARS) return copy;
+  return {
     action: payload.action,
     scope: payload.scope,
     source: typeof payload.source === "string" ? clip(payload.source, 1000) : undefined,
@@ -672,7 +672,7 @@ function fitOutput(payload: Record<string, unknown>): string {
     returned: 0,
     truncated: true,
     note: `Output exceeded ${HARD_OUTPUT_CHARS} characters. Narrow the query or lower limit/maxChars.`,
-  });
+  };
 }
 
 function resultDetails(
@@ -851,9 +851,10 @@ export default function sessionInspector(pi: ExtensionAPI) {
             break;
           }
         }
+        const fitted = fitPayload(payload);
         return {
-          content: [{ type: "text", text: fitOutput(payload) }],
-          details: resultDetails(action, scope, source, payload),
+          content: [{ type: "text", text: JSON.stringify(fitted) }],
+          details: resultDetails(action, scope, source, fitted),
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
