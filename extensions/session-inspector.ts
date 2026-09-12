@@ -11,6 +11,7 @@ import {
   type ReadonlySessionManager,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const TOOL_NAME = "session_inspect";
@@ -35,11 +36,11 @@ type RecordPayload = Record<string, unknown> & {
   truncated: boolean;
 };
 
-function expandPath(input: string): string {
+function expandPath(input: string, cwd: string): string {
   const normalized = input.startsWith("@") ? input.slice(1) : input;
   if (normalized === "~") return homedir();
   if (normalized.startsWith("~/")) return resolve(homedir(), normalized.slice(2));
-  return resolve(normalized);
+  return resolve(cwd, normalized);
 }
 
 function iso(ts: string | number | undefined): string | undefined {
@@ -113,21 +114,30 @@ function isInspectorResult(entry: SessionEntry): boolean {
   );
 }
 
+type ToolCall = { id: string; name: string; arguments: unknown };
+
 function toolCallsFromMessage(
+  message: Extract<SessionEntry, { type: "message" }>["message"],
+): ToolCall[] {
+  if (message.role !== "assistant") return [];
+  const calls: ToolCall[] = [];
+  for (const block of message.content) {
+    if (block.type === "toolCall" && block.name !== TOOL_NAME) {
+      calls.push({ id: block.id, name: block.name, arguments: block.arguments });
+    }
+  }
+  return calls;
+}
+
+function boundedToolCalls(
   message: Extract<SessionEntry, { type: "message" }>["message"],
   maxChars: number,
 ) {
-  if (message.role !== "assistant") return [];
-  return message.content
-    .filter((block) => block.type === "toolCall" && block.name !== TOOL_NAME)
-    .map((block) => ({
-      id: block.type === "toolCall" ? block.id : "",
-      name: block.type === "toolCall" ? block.name : "",
-      arguments:
-        block.type === "toolCall" ? boundedJson(block.arguments, maxChars) : "",
-      rawArguments:
-        block.type === "toolCall" ? redact(jsonText(block.arguments)) : "",
-    }));
+  return toolCallsFromMessage(message).map((call) => ({
+    id: call.id,
+    name: call.name,
+    arguments: boundedJson(call.arguments, maxChars),
+  }));
 }
 
 function getEntriesForScope(
@@ -155,16 +165,14 @@ function messageRecord(
     case "user":
       return { ...base, role: "user", text: boundedText(message.content, maxChars) };
     case "assistant": {
-      const calls = toolCallsFromMessage(message, maxChars);
+      const calls = toolCallsFromMessage(message);
       return {
         ...base,
         role: "assistant",
         text: boundedText(message.content, maxChars),
         ...(calls.length ? { tools: calls.map((call) => call.name) } : {}),
         ...(detailed && calls.length
-          ? {
-              toolCalls: calls.map(({ rawArguments: _rawArguments, ...call }) => call),
-            }
+          ? { toolCalls: boundedToolCalls(message, maxChars) }
           : {}),
         ...(message.stopReason !== "stop" && message.stopReason !== "toolUse"
           ? { stopReason: message.stopReason }
@@ -319,16 +327,34 @@ function addUsage(total: UsageTotals, usage: Usage | undefined): void {
   total.cost += Number(usage.cost?.total ?? 0);
 }
 
-function leafPaths(manager: ReadonlySessionManager) {
-  const leaves: Array<{ entry: SessionEntry; path: SessionEntry[] }> = [];
-  function visit(nodes: TreeNode[], path: SessionEntry[]): void {
-    for (const node of nodes) {
-      const nextPath = [...path, node.entry];
-      if (node.children.length === 0) leaves.push({ entry: node.entry, path: nextPath });
-      else visit(node.children, nextPath);
+function leafRecords(manager: ReadonlySessionManager) {
+  const leaves: Array<{
+    entry: SessionEntry;
+    depth: number;
+    lastMessage?: Extract<SessionEntry, { type: "message" }>;
+  }> = [];
+  const stack: Array<{
+    node: TreeNode;
+    depth: number;
+    lastMessage?: Extract<SessionEntry, { type: "message" }>;
+  }> = [...manager.getTree()].reverse().map((node) => ({ node, depth: 1 }));
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    const { node, depth } = current;
+    const lastMessage =
+      node.entry.type === "message" && !isInspectorResult(node.entry)
+        ? node.entry
+        : current.lastMessage;
+    if (node.children.length === 0) {
+      leaves.push({ entry: node.entry, depth, lastMessage });
+      continue;
+    }
+    for (const child of [...node.children].reverse()) {
+      stack.push({ node: child, depth: depth + 1, lastMessage });
     }
   }
-  visit(manager.getTree(), []);
   return leaves;
 }
 
@@ -372,7 +398,7 @@ function summarize(manager: ReadonlySessionManager, entries: SessionEntry[]) {
       assistants++;
       addUsage(usage, message.usage);
       if (message.stopReason === "error" || message.errorMessage) assistantErrors++;
-      for (const call of toolCallsFromMessage(message, 120)) {
+      for (const call of toolCallsFromMessage(message)) {
         toolCalls++;
         tools[call.name] = (tools[call.name] ?? 0) + 1;
       }
@@ -384,7 +410,7 @@ function summarize(manager: ReadonlySessionManager, entries: SessionEntry[]) {
     }
   }
 
-  const leaves = leafPaths(manager);
+  const leaves = leafRecords(manager);
   return {
     session: {
       id: manager.getSessionId(),
@@ -417,7 +443,7 @@ function toolRecords(entries: SessionEntry[], maxChars: number): ToolRecord[] {
     if (entry.type !== "message") continue;
     const message = entry.message;
     if (message.role === "assistant") {
-      for (const call of toolCallsFromMessage(message, maxChars)) {
+      for (const call of boundedToolCalls(message, maxChars)) {
         const record: ToolRecord = {
           entryId: entry.id,
           ts: iso(message.timestamp ?? entry.timestamp),
@@ -489,9 +515,9 @@ function searchFields(entry: SessionEntry): SearchField[] {
         break;
       case "assistant":
         fields.push({ field: "message.text", text: redact(contentText(message.content)) });
-        for (const call of toolCallsFromMessage(message, Number.MAX_SAFE_INTEGER)) {
+        for (const call of toolCallsFromMessage(message)) {
           fields.push({ field: "tool.name", text: call.name, tool: call.name });
-          fields.push({ field: "tool.arguments", text: call.rawArguments, tool: call.name });
+          fields.push({ field: "tool.arguments", text: redact(jsonText(call.arguments)), tool: call.name });
         }
         if (message.errorMessage) fields.push({ field: "assistant.error", text: redact(message.errorMessage) });
         break;
@@ -588,12 +614,11 @@ function searchRecords(entries: SessionEntry[], query: string, maxChars: number)
 function branchRecords(manager: ReadonlySessionManager, maxChars: number) {
   const activeLeaf = manager.getLeafId();
   const activeIds = new Set(manager.getBranch().map((entry) => entry.id));
-  return leafPaths(manager).map(({ entry, path }) => {
-    const lastMessage = [...path].reverse().find((candidate) => candidate.type === "message" && !isInspectorResult(candidate));
+  return leafRecords(manager).map(({ entry, depth, lastMessage }) => {
     return {
       leafId: entry.id,
       active: entry.id === activeLeaf || activeIds.has(entry.id),
-      depth: path.length,
+      depth,
       last: lastMessage ? compactEntry(lastMessage, maxChars) : compactEntry(entry, maxChars),
     };
   });
@@ -650,6 +675,45 @@ function fitOutput(payload: Record<string, unknown>): string {
   });
 }
 
+function resultDetails(
+  action: Action,
+  scope: Scope,
+  source: string,
+  payload: Record<string, unknown>,
+) {
+  const details: Record<string, unknown> = {
+    action,
+    scope,
+    source,
+    ok: !payload.error,
+  };
+  if (typeof payload.error === "string") {
+    details.error = clip(payload.error, 240);
+  }
+  if (Array.isArray(payload.records)) {
+    details.returned = payload.returned;
+    details.total = payload.total;
+    details.summary =
+      action === "search"
+        ? `${payload.returned} matches`
+        : `${payload.returned} ${action} records`;
+  } else if (action === "summary") {
+    const messages = payload.messages as { assistant?: unknown; toolResult?: unknown } | undefined;
+    const tools = payload.tools as { calls?: unknown; errors?: unknown } | undefined;
+    details.summary = [
+      typeof payload.entries === "number" ? `${payload.entries} entries` : undefined,
+      typeof tools?.calls === "number" ? `${tools.calls} tool calls` : undefined,
+      typeof tools?.errors === "number" ? `${tools.errors} errors` : undefined,
+      messages && typeof messages.assistant === "number"
+        ? `${messages.assistant} assistant messages`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+  return details;
+}
+
 function loadHistorical(path: string): SessionManager {
   const fileEntries = parseSessionEntries(readFileSync(path, "utf8"));
   migrateSessionEntries(fileEntries);
@@ -681,6 +745,36 @@ export default function sessionInspector(pi: ExtensionAPI) {
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
       maxChars: Type.Optional(Type.Integer({ minimum: 120, maximum: 2000 })),
     }),
+    renderCall(args, theme) {
+      const action = typeof args.action === "string" ? args.action : "inspect";
+      const query =
+        action === "search" && typeof args.query === "string" && args.query.trim()
+          ? ` "${clip(args.query, 80)}"`
+          : "";
+      return new Text(
+        `${theme.fg("toolTitle", theme.bold("session_inspect"))} ${theme.fg("muted", `${action}${query}`)}`,
+        0,
+        0,
+      );
+    },
+    renderResult(result, { expanded, isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Processing…"), 0, 0);
+      const details = result.details as Record<string, unknown> | undefined;
+      if (details?.ok === false) {
+        const error = typeof details.error === "string" ? details.error : "session_inspect failed";
+        return new Text(theme.fg("error", `✗ ${error}`), 0, 0);
+      }
+      if (!expanded) {
+        const summary =
+          typeof details?.summary === "string" && details.summary
+            ? details.summary
+            : typeof details?.action === "string"
+              ? details.action
+              : "Done";
+        return new Text(theme.fg("success", `✓ ${summary}`), 0, 0);
+      }
+      return new Text(contentText(result.content), 0, 0);
+    },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const action = params.action as Action;
       const scope = (params.scope ?? "branch") as Scope;
@@ -691,7 +785,7 @@ export default function sessionInspector(pi: ExtensionAPI) {
 
       try {
         if (params.session) {
-          const path = expandPath(params.session);
+          const path = expandPath(params.session, ctx.cwd);
           if (!path.endsWith(".jsonl")) throw new Error("session must point to a .jsonl Pi session file");
           manager = loadHistorical(path);
           source = path;
@@ -749,14 +843,14 @@ export default function sessionInspector(pi: ExtensionAPI) {
         }
         return {
           content: [{ type: "text", text: fitOutput(payload) }],
-          details: { action, scope, source, ok: !payload.error },
+          details: resultDetails(action, scope, source, payload),
         };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const payload = { error: message };
         return {
           content: [{ type: "text", text: JSON.stringify(payload) }],
-          details: { action, scope, source, ok: false },
+          details: { action, scope, source, ok: false, error: message },
         };
       }
     },

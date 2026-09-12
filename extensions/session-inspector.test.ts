@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -12,6 +11,22 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import sessionInspector from "./session-inspector.ts";
+
+type Test = (name: string, fn: () => Promise<void>) => void;
+const pendingTests: Promise<void>[] = [];
+const test: Test = process.env.PI_SESSION_INSPECTOR_PI
+  ? (name, fn) => {
+      pendingTests.push(
+        Promise.resolve()
+          .then(fn)
+          .then(() => console.log(`PASS ${name}`))
+          .catch((error) => {
+            console.error(`FAIL ${name}`, error);
+            throw error;
+          }),
+      );
+    }
+  : ((await import("node:test")).test as Test);
 
 const usage = (value: number): Usage => ({
   input: value,
@@ -155,6 +170,39 @@ test("inspects typed timestamps, evidence, usage, branches, and bounded tails", 
   const sessionManager = manager(entries, branch, tree);
   const ctx = { sessionManager } as unknown as ExtensionContext;
   const definition = tool();
+  assert.ok(definition.renderCall);
+  assert.ok(definition.renderResult);
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  } as never;
+  const renderedCall = definition.renderCall(
+    { action: "search", query: "auth.ts" } as never,
+    theme,
+    {} as never,
+  );
+  assert.match(renderedCall.render(200).join("\n"), /session_inspect search "auth\.ts"/);
+  const renderResult = definition.renderResult;
+  const successResult = {
+    content: [{ type: "text", text: '{"action":"summary","entries":3}' }],
+    details: { action: "summary", ok: true, summary: "3 entries · 1 tool calls · 0 errors" },
+  } as never;
+  assert.match(
+    renderResult(successResult, { expanded: false, isPartial: false }, theme, {} as never).render(200).join("\n"),
+    /✓ 3 entries · 1 tool calls · 0 errors/,
+  );
+  assert.match(
+    renderResult(successResult, { expanded: true, isPartial: false }, theme, {} as never).render(200).join("\n"),
+    /\{"action":"summary","entries":3\}/,
+  );
+  const errorResult = {
+    content: [{ type: "text", text: '{"error":"missing session"}' }],
+    details: { action: "summary", ok: false, error: "missing session" },
+  } as never;
+  assert.match(
+    renderResult(errorResult, { expanded: false, isPartial: false }, theme, {} as never).render(200).join("\n"),
+    /✗ missing session/,
+  );
 
   const timeline = output(await definition.execute("1", { action: "timeline", maxChars: 120 }, undefined, undefined, ctx));
   assert.equal(timeline.records[0].ts, new Date(1_700_000_000_000).toISOString());
@@ -216,16 +264,27 @@ test("reads and migrates historical sessions without rewriting them", async () =
     "",
   ].join("\n");
   writeFileSync(path, original);
+  assert.notEqual(directory, process.cwd());
   const definition = tool();
-  const result = await definition.execute("8", { action: "summary", session: `@${path}` }, undefined, undefined, {
+  const historicalContext = {
+    cwd: directory,
     sessionManager: {} as ReadonlySessionManager,
-  } as unknown as ExtensionContext);
+  } as unknown as ExtensionContext;
+  const result = await definition.execute("8", { action: "summary", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
   assert.equal(output(result).session.id, "legacy-session");
-  const timeline = await definition.execute("9", { action: "timeline", session: path }, undefined, undefined, {
-    sessionManager: {} as ReadonlySessionManager,
-  } as unknown as ExtensionContext);
+  const timeline = await definition.execute("9", { action: "timeline", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
   const timelineOutput = output(timeline);
   assert.equal(timelineOutput.records.length, 1);
   assert.equal(timelineOutput.records[0].text, "legacy");
   assert.equal(readFileSync(path, "utf8"), original);
 });
+
+if (process.env.PI_SESSION_INSPECTOR_PI) {
+  try {
+    await Promise.all(pendingTests);
+    console.log("session-inspector regression suite passed");
+    process.exit(0);
+  } catch {
+    process.exit(1);
+  }
+}

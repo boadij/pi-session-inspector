@@ -10,6 +10,16 @@ pi install /absolute/path/to/pi-session-inspector
 
 Reload Pi after installing.
 
+## Tests
+
+With Pi 0.85.1 installed and available as `pi`, run the regression suite through Pi's bundled extension loader:
+
+```bash
+bun run test
+```
+
+The test command does not install or bundle Pi's peer packages.
+
 ## Actions
 
 `session_inspect` supports:
