@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
@@ -203,6 +203,9 @@ test("inspects typed timestamps, evidence, usage, branches, and bounded tails", 
     renderResult(errorResult, { expanded: false, isPartial: false }, theme, {} as never).render(200).join("\n"),
     /✗ missing session/,
   );
+  const expandedError = renderResult(errorResult, { expanded: true, isPartial: false }, theme, {} as never).render(200).join("\n");
+  assert.match(expandedError, /\{"error":"missing session"\}/);
+  assert.doesNotMatch(expandedError, /✗ missing session/);
 
   const timeline = output(await definition.execute("1", { action: "timeline", maxChars: 120 }, undefined, undefined, ctx));
   assert.equal(timeline.records[0].ts, new Date(1_700_000_000_000).toISOString());
@@ -253,30 +256,40 @@ test("inspects typed timestamps, evidence, usage, branches, and bounded tails", 
   assert.equal(bounded.truncated, true);
   assert.equal(bounded.records.at(-1).id, "tail-29");
   assert.equal(bounded.records.some((record: { id: string }) => record.id === "tail-0"), false);
+  const limitedResult = await definition.execute("7b", { action: "timeline", scope: "all", limit: 1 }, undefined, undefined, { sessionManager: manager(many, branch, tree) } as unknown as ExtensionContext);
+  const limitedPayload = output(limitedResult);
+  assert.match(
+    renderResult(limitedResult, { expanded: false, isPartial: false }, theme, {} as never).render(200).join("\n"),
+    new RegExp(`✓ ${limitedPayload.total} timeline entries · 1 shown`),
+  );
 });
 
 test("reads and migrates historical sessions without rewriting them", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-session-inspector-"));
-  const path = join(directory, "legacy.jsonl");
-  const original = [
-    JSON.stringify({ type: "session", version: 1, id: "legacy-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: process.cwd() }),
-    JSON.stringify({ type: "message", message: { role: "user", content: "legacy", timestamp: 1_700_000_000_000 } }),
-    "",
-  ].join("\n");
-  writeFileSync(path, original);
-  assert.notEqual(directory, process.cwd());
-  const definition = tool();
-  const historicalContext = {
-    cwd: directory,
-    sessionManager: {} as ReadonlySessionManager,
-  } as unknown as ExtensionContext;
-  const result = await definition.execute("8", { action: "summary", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
-  assert.equal(output(result).session.id, "legacy-session");
-  const timeline = await definition.execute("9", { action: "timeline", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
-  const timelineOutput = output(timeline);
-  assert.equal(timelineOutput.records.length, 1);
-  assert.equal(timelineOutput.records[0].text, "legacy");
-  assert.equal(readFileSync(path, "utf8"), original);
+  try {
+    const path = join(directory, "legacy.jsonl");
+    const original = [
+      JSON.stringify({ type: "session", version: 1, id: "legacy-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: process.cwd() }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "legacy", timestamp: 1_700_000_000_000 } }),
+      "",
+    ].join("\n");
+    writeFileSync(path, original);
+    assert.notEqual(directory, process.cwd());
+    const definition = tool();
+    const historicalContext = {
+      cwd: directory,
+      sessionManager: {} as ReadonlySessionManager,
+    } as unknown as ExtensionContext;
+    const result = await definition.execute("8", { action: "summary", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
+    assert.equal(output(result).session.id, "legacy-session");
+    const timeline = await definition.execute("9", { action: "timeline", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
+    const timelineOutput = output(timeline);
+    assert.equal(timelineOutput.records.length, 1);
+    assert.equal(timelineOutput.records[0].text, "legacy");
+    assert.equal(readFileSync(path, "utf8"), original);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 if (process.env.PI_SESSION_INSPECTOR_PI) {

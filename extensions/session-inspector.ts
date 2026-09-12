@@ -691,12 +691,22 @@ function resultDetails(
     details.error = clip(payload.error, 240);
   }
   if (Array.isArray(payload.records)) {
-    details.returned = payload.returned;
-    details.total = payload.total;
+    const returned = typeof payload.returned === "number" ? payload.returned : payload.records.length;
+    const total = typeof payload.total === "number" ? payload.total : returned;
+    details.returned = returned;
+    details.total = total;
+    const label: Partial<Record<Action, string>> = {
+      search: "matches",
+      timeline: "timeline entries",
+      tools: "tool calls",
+      errors: "errors",
+      branches: "branches",
+    };
+    const labelText = label[action] ?? "records";
     details.summary =
-      action === "search"
-        ? `${payload.returned} matches`
-        : `${payload.returned} ${action} records`;
+      returned < total
+        ? `${total} ${labelText} · ${returned} shown`
+        : `${returned} ${labelText}`;
   } else if (action === "summary") {
     const messages = payload.messages as { assistant?: unknown; toolResult?: unknown } | undefined;
     const tools = payload.tools as { calls?: unknown; errors?: unknown } | undefined;
@@ -760,7 +770,7 @@ export default function sessionInspector(pi: ExtensionAPI) {
     renderResult(result, { expanded, isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Processing…"), 0, 0);
       const details = result.details as Record<string, unknown> | undefined;
-      if (details?.ok === false) {
+      if (!expanded && details?.ok === false) {
         const error = typeof details.error === "string" ? details.error : "session_inspect failed";
         return new Text(theme.fg("error", `✗ ${error}`), 0, 0);
       }
