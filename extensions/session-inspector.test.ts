@@ -275,7 +275,7 @@ test("reads and migrates historical sessions without rewriting them", async () =
   try {
     const path = join(directory, "legacy.jsonl");
     const original = [
-      JSON.stringify({ type: "session", version: 1, id: "legacy-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: process.cwd() }),
+      JSON.stringify({ type: "session", version: 1, id: "legacy-session", timestamp: "2026-01-01T00:00:00.000Z", cwd: directory }),
       JSON.stringify({ type: "message", message: { role: "user", content: "legacy", timestamp: 1_700_000_000_000 } }),
       "",
     ].join("\n");
@@ -284,10 +284,15 @@ test("reads and migrates historical sessions without rewriting them", async () =
     const definition = tool();
     const historicalContext = {
       cwd: directory,
-      sessionManager: {} as ReadonlySessionManager,
+      sessionManager: {
+        getSessionDir: () => directory,
+      } as ReadonlySessionManager,
     } as unknown as ExtensionContext;
     const result = await definition.execute("8", { action: "summary", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
     assert.equal(output(result).session.id, "legacy-session");
+    const byId = await definition.execute("8b", { action: "summary", session: "legacy-session" }, undefined, undefined, historicalContext);
+    assert.equal(output(byId).session.id, "legacy-session");
+    assert.equal(output(byId).source, path);
     const timeline = await definition.execute("9", { action: "timeline", session: "legacy.jsonl" }, undefined, undefined, historicalContext);
     const timelineOutput = output(timeline);
     assert.equal(timelineOutput.records.length, 1);

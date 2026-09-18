@@ -738,7 +738,7 @@ export default function sessionInspector(pi: ExtensionAPI) {
     name: TOOL_NAME,
     label: "Session Inspect",
     description:
-      "Efficiently inspect the current Pi session, or an explicitly specified Pi session file, without dumping raw JSONL. Returns bounded structured evidence for summaries, timelines, tools, errors, searches, branches, or individual entries.",
+      "Efficiently inspect the current Pi session, or a historical Pi session by exact session ID or .jsonl path, without dumping raw JSONL. Returns bounded structured evidence for summaries, timelines, tools, errors, searches, branches, or individual entries.",
     promptSnippet: "Inspect Pi sessions with bounded, branch-aware structured output",
     promptGuidelines: [
       "session_inspect: start analysis with action=summary, then narrow to targeted evidence.",
@@ -749,7 +749,12 @@ export default function sessionInspector(pi: ExtensionAPI) {
     parameters: Type.Object({
       action: StringEnum(["summary", "timeline", "tools", "errors", "search", "branches", "entry"] as const),
       scope: Type.Optional(StringEnum(["branch", "all", "context"] as const)),
-      session: Type.Optional(Type.String()),
+      session: Type.Optional(
+        Type.String({
+          description:
+            "Historical Pi session as an exact session ID or .jsonl path. Omit for the active session.",
+        }),
+      ),
       query: Type.Optional(Type.String()),
       entryId: Type.Optional(Type.String()),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
@@ -795,8 +800,25 @@ export default function sessionInspector(pi: ExtensionAPI) {
 
       try {
         if (params.session) {
-          const path = expandPath(params.session, ctx.cwd);
-          if (!path.endsWith(".jsonl")) throw new Error("session must point to a .jsonl Pi session file");
+          const isPath =
+            params.session.includes("/") ||
+            params.session.includes("\\") ||
+            params.session.endsWith(".jsonl");
+
+          const path = isPath
+            ? expandPath(params.session, ctx.cwd)
+            : (
+                await SessionManager.list(
+                  ctx.cwd,
+                  ctx.sessionManager.getSessionDir() || undefined,
+                )
+              ).find(({ id }) => id === params.session)?.path;
+
+          if (!path) throw new Error(`session not found: ${params.session}`);
+          if (!path.endsWith(".jsonl")) {
+            throw new Error("session must point to a .jsonl Pi session file");
+          }
+
           manager = loadHistorical(path);
           source = path;
         }
