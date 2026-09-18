@@ -1,6 +1,6 @@
 # Pi Session Inspector
 
-`pi-session-inspector` adds one model-callable Pi extension tool, `session_inspect`, for bounded, branch-aware inspection of the active session or an explicitly supplied historical `.jsonl` session.
+`pi-session-inspector` adds one model-callable Pi extension tool, `session_inspect`, for bounded, branch-aware inspection of the active session or a historical Pi session selected by exact session ID or `.jsonl` path.
 
 ## Install
 
@@ -38,12 +38,13 @@ Scopes:
 - `all` - entire session tree
 - `context` - active branch after Pi's context/compaction rules
 
-By default the tool inspects the active session. `session` may point explicitly to another Pi `.jsonl` session file; historical files are parsed and migrated in memory and are never rewritten.
+By default the tool inspects the active session. `session` may be an exact session ID from the current Pi project or an explicit `.jsonl` path. Historical files are parsed and migrated in memory and are never rewritten.
 
 ## Typical agent workflow
 
 ```text
 session_inspect(action="summary")
+session_inspect(action="summary", session="0199...")
 session_inspect(action="errors", limit=10)
 session_inspect(action="search", query="src/auth.ts", limit=10)
 session_inspect(action="entry", entryId="...")
