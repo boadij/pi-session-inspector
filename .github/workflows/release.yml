@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub release tag to retry npm publishing
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - id: release
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@v5
+
+      - id: target
+        env:
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RETRY_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            [ "$RELEASE_CREATED" = true ] || exit 0
+            tag=$RELEASE_TAG
+          else
+            tag=$RETRY_TAG
+          fi
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - if: steps.target.outputs.tag != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.tag }}
+          persist-credentials: false
+
+      - if: steps.target.outputs.tag != ''
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Publish verified release to npm
+        if: steps.target.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$TAG" --json isDraft,isPrerelease --jq '(.isDraft | not) and (.isPrerelease | not)')" = true
+          test "$(node -p "require('./package.json').name")" = pi-session-inspector
+          test "v$(node -p "require('./package.json').version")" = "$TAG"
+          npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.5.2
+          npm test
+          npm pack --dry-run
+          if npm view "pi-session-inspector@${TAG#v}" version >/dev/null 2>&1; then
+            echo "$TAG is already published"
+          else
+            npm publish
+          fi
