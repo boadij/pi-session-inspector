@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
+import { CURRENT_SESSION_VERSION } from "@earendil-works/pi-coding-agent";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -299,6 +301,197 @@ test("reads and migrates historical sessions without rewriting them", async () =
     assert.equal(timelineOutput.records[0].text, "legacy");
     assert.equal(readFileSync(path, "utf8"), original);
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+async function fileDigest(path: string) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+test("queries bounded historical tool evidence across sessions without rewriting them", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-session-inspector-history-"));
+  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = join(directory, "agent");
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const cwd = join(directory, "project");
+    const otherCwd = join(directory, "other");
+    const project = join(agentDir, "sessions", "--project--");
+    const other = join(agentDir, "sessions", "--other--");
+    for (const dir of [cwd, otherCwd, project, other]) mkdirSync(dir, { recursive: true });
+    const originals = new Map<string, string>();
+    const timestamp = 1_700_000_000_000;
+    const secret = "sk-fixture-example-not-a-real-key";
+    const call = (id: string, name = "delegate_agent") => ({
+      type: "toolCall",
+      id,
+      name,
+      arguments: { token: secret, task: "x".repeat(2_000) },
+    });
+    const assistant = (id: string, parentId: string | null, ...content: ReturnType<typeof call>[]) =>
+      entry(id, parentId, { role: "assistant", content, timestamp });
+    const result = (id: string, parentId: string | null, toolCallId: string, isError: boolean) =>
+      entry(id, parentId, {
+        role: "toolResult", toolCallId, toolName: "delegate_agent", isError,
+        content: [{ type: "text", text: "private-result-body" }], timestamp,
+      });
+    function writeSession(file: string, id: string, entries: unknown[], options: Record<string, unknown> = {}, sessionDir = project) {
+      const path = join(sessionDir, file);
+      const original = [
+        JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION, id, cwd, timestamp: new Date(timestamp).toISOString(), ...options }),
+        ...entries.map((item) => typeof item === "string" ? item : JSON.stringify(item)),
+        "",
+      ].join("\n");
+      writeFileSync(path, original);
+      originals.set(path, original);
+      return path;
+    }
+    const largeCallId = "large-" + "x".repeat(16_000);
+    const abandoned = assistant("copied-entry", null, call("copied-call"), call("not-exact", "Delegate_agent"),
+      call(largeCallId, "large_tool"));
+    const ok = result("ok-entry", abandoned.id, "copied-call", false);
+    const branch = assistant("other-branch", abandoned.id, call("error-call"), call("pending-call"), call("self-call", "session_inspect"));
+    const parent = writeSession("60.jsonl", "original", [
+      abandoned, ok, branch, result("error-entry", branch.id, "error-call", true),
+      result("orphan-result", branch.id, "orphan-call", false),
+      assistant("unfittable-entry", branch.id, call("x".repeat(31_000), "unfittable_tool")),
+      assistant("many-calls", branch.id, ...Array.from({ length: 47 }, (_, i) => call(`many-${i}`))),
+    ]);
+    writeSession("50.jsonl", "fork", [abandoned, ok,
+      assistant("small-entry", ok.id, call("small", "unfittable_tool")),
+    ], { parentSession: parent });
+    writeSession("30.jsonl", "malformed", [abandoned, "{bad json"]);
+    const oversized = join(project, "40.jsonl");
+    writeFileSync(oversized, "");
+    truncateSync(oversized, 128 * 1024 * 1024 + 1); // Sparse: exceed the input budget without writing 128 MiB.
+    const oversizedDigest = await fileDigest(oversized);
+    writeSession("20.jsonl", "legacy", [{ type: "message", message: {
+      role: "assistant", content: [call("legacy-call")], timestamp,
+    } }], { version: 1 });
+    writeSession("70.jsonl", "other", [assistant("other-entry", null, call("other-call"))], { cwd: otherCwd }, other);
+
+    const ctx = { cwd, sessionManager: { getSessionDir: () => project } } as unknown as ExtensionContext;
+    const definition = tool();
+    const request = (options: Record<string, unknown> = {}) =>
+      definition.execute("history", { action: "tools", history: "project", tool: "delegate_agent", ...options }, undefined, undefined, ctx);
+    const query = async (options: Record<string, unknown> = {}) => output(await request(options));
+
+    const first = await query({ sessionLimit: 1, limit: 50 });
+    assert.equal(first.error, undefined);
+    assert.deepEqual(first.coverage, {
+      discovered: 5, attempted: 1, scanned: 1, failed: 0, matchingOccurrences: 50,
+      returned: 50, scanComplete: false, examplesTruncated: false,
+    });
+    assert.ok(first.nextCursor);
+    const byCall = (callId: string) => first.records.find((record: { callId: string }) => record.callId === callId);
+    const copied = byCall("copied-call");
+    assert.equal(copied.sessionId, "original");
+    assert.equal(copied.sessionPath, realpathSync(parent));
+    assert.equal(copied.parentSession, null);
+    assert.equal(copied.entryId, "copied-entry");
+    assert.equal(copied.resultEntryId, "ok-entry");
+    assert.equal(copied.status, "ok");
+    assert.equal(byCall("error-call").status, "error");
+    assert.equal(byCall("error-call").resultEntryId, "error-entry");
+    assert.equal(byCall("pending-call").status, "pending");
+    assert.ok(first.records.every((record: object) => !Object.hasOwn(record, "arguments")));
+    assert.doesNotMatch(JSON.stringify(first), /private-result-body/);
+
+    const sampled = await query({ sessionLimit: 1, limit: 2 });
+    assert.equal(sampled.coverage.matchingOccurrences, 50);
+    assert.equal(sampled.coverage.returned, 2);
+    assert.equal(sampled.coverage.examplesTruncated, true);
+    assert.deepEqual(new Set(sampled.records.map((record: { callId: string }) => record.callId)), new Set(["many-45", "many-46"]));
+
+    const limited = await query({ sessionLimit: 3, limit: 1 });
+    assert.equal(limited.coverage.matchingOccurrences, 50, "example limit must not advance past an unrepresented fork");
+    assert.equal(limited.records[0].sessionId, "original");
+    assert.ok(limited.nextCursor);
+    const limitedNext = await query({ cursor: limited.nextCursor, sessionLimit: 1, limit: 1 });
+    assert.equal(limitedNext.records[0].sessionId, "fork");
+
+    const largePage = await query({ tool: "large_tool", limit: 50 });
+    assert.equal(largePage.coverage.attempted, 2);
+    assert.equal(largePage.coverage.scanned, 1, "hard cap must not advance past an unrepresented fork");
+    assert.equal(largePage.coverage.matchingOccurrences, 1);
+    assert.deepEqual(largePage.records.map((record: { sessionId: string }) => record.sessionId), ["original"]);
+    assert.ok(largePage.nextCursor);
+    const largeNext = await query({ tool: "large_tool", cursor: largePage.nextCursor });
+    assert.deepEqual(largeNext.records.map((record: { sessionId: string }) => record.sessionId), ["fork"]);
+
+    const impossible = await query({ tool: "unfittable_tool", sessionLimit: 1 });
+    assert.equal(impossible.coverage.scanned, 0);
+    assert.equal(impossible.coverage.matchingOccurrences, 0);
+    assert.equal(impossible.coverage.failed, 1);
+    assert.match(JSON.stringify(impossible.failures), /no sampled example fits/);
+    assert.ok(impossible.nextCursor);
+    const afterImpossible = await query({ tool: "unfittable_tool", cursor: impossible.nextCursor, sessionLimit: 1 });
+    assert.deepEqual(afterImpossible.records.map((record: { sessionId: string }) => record.sessionId), ["fork"]);
+
+    const trimmedResult = await request({ sessionLimit: 3, limit: 50, maxChars: 2_000, includeArguments: true });
+    const trimmed = output(trimmedResult);
+    assert.ok((trimmedResult.content[0]?.text ?? "").length <= 30_000);
+    assert.equal(trimmed.coverage.matchingOccurrences, 51);
+    assert.equal(trimmed.coverage.failed, 1);
+    assert.match(JSON.stringify(trimmed.failures), /session exceeds the 128 MiB scan budget/);
+    assert.equal(trimmed.coverage.returned, trimmed.records.length);
+    assert.ok(trimmed.records.length > 0 && trimmed.records.length < 50);
+    assert.equal(trimmed.coverage.examplesTruncated, true);
+    assert.equal(trimmed.coverage.scanComplete, false);
+    assert.ok(trimmed.records.every((record: { arguments: string }) => record.arguments.length <= 2_000));
+    assert.ok(trimmed.records.every((record: { arguments: string }) => record.arguments.includes("[REDACTED_KEY]")));
+    assert.ok(!JSON.stringify(trimmed).includes(secret));
+    assert.doesNotMatch(JSON.stringify(trimmed), /private-result-body/);
+    assert.ok(trimmed.nextCursor);
+    assert.deepEqual(new Set(trimmed.records.map((record: { sessionId: string }) => record.sessionId)), new Set(["original", "fork"]));
+
+    const second = await query({ cursor: first.nextCursor, sessionLimit: 2 });
+    assert.deepEqual(second.coverage, {
+      discovered: 5, attempted: 2, scanned: 1, failed: 1, matchingOccurrences: 1,
+      returned: 1, scanComplete: false, examplesTruncated: false,
+    });
+    assert.equal(second.records[0].sessionId, "fork");
+    assert.equal(second.records[0].parentSession, parent);
+    assert.equal(second.records[0].entryId, copied.entryId);
+    assert.equal(second.records[0].callId, copied.callId);
+    assert.ok(second.nextCursor);
+    assert.equal(trimmed.nextCursor, second.nextCursor);
+
+    const third = await query({ cursor: second.nextCursor, sessionLimit: 2 });
+    assert.deepEqual(third.coverage, {
+      discovered: 5, attempted: 2, scanned: 1, failed: 1, matchingOccurrences: 1,
+      returned: 1, scanComplete: false, examplesTruncated: false,
+    });
+    assert.equal(third.records[0].sessionId, "legacy");
+    assert.equal(third.records[0].callId, "legacy-call");
+    assert.match(JSON.stringify(third.failures), /malformed JSONL/);
+    assert.ok(!third.nextCursor);
+
+    assert.match((await query({ cursor: "not-a-cursor" })).error, /cursor/i);
+    assert.match((await query({ cursor: first.nextCursor, tool: "different" })).error, /cursor/i);
+    assert.match((await query({ session: "60.jsonl" })).error, /session/i);
+    assert.match((await query({ scope: "branch" })).error, /scope/i);
+    assert.match((await query({ tool: " " })).error, /tool/i);
+    const all = await query({ history: "all-projects", sessionLimit: 1 });
+    assert.equal(all.coverage.discovered, 6);
+    assert.equal(all.coverage.matchingOccurrences, 1);
+    assert.equal(all.records[0].sessionId, "other");
+    const empty = output(await definition.execute("history-empty", {
+      action: "tools", history: "project", tool: "unrecorded",
+    }, undefined, undefined, { cwd: otherCwd, sessionManager: { getSessionDir: () => other } } as unknown as ExtensionContext));
+    assert.deepEqual(empty.coverage, {
+      discovered: 1, attempted: 1, scanned: 1, failed: 0, matchingOccurrences: 0,
+      returned: 0, scanComplete: true, examplesTruncated: false,
+    });
+
+    for (const [path, original] of originals) assert.equal(readFileSync(path, "utf8"), original, path);
+    assert.equal(await fileDigest(oversized), oversizedDigest);
+  } finally {
+    if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = oldAgentDir;
     rmSync(directory, { recursive: true, force: true });
   }
 });
