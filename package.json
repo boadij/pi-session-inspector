@@ -25,5 +25,9 @@
     "extensions": [
       "./extensions/session-inspector.ts"
     ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boadij/pi-session-inspector.git"
   }
 }

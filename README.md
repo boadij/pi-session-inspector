@@ -12,13 +12,21 @@ Reload Pi after installing.
 
 ## Tests
 
-With Pi 0.85.1 installed and available as `pi`, run the regression suite through Pi's bundled extension loader:
+With Pi 1.5.2 installed and available as `pi`, run the regression suite through Pi's bundled extension loader:
 
 ```bash
-bun run test
+npm test
 ```
 
 The test command does not install or bundle Pi's peer packages.
+
+## CI and releases
+
+Pull requests and pushes to `main` run the regression suite on Pi 1.5.2 and check the npm package contents.
+
+[Release Please](https://github.com/googleapis/release-please-action) prepares version/changelog PRs from Conventional Commits. Merging a release PR creates a GitHub release and publishes that version to npm using [trusted publishing](https://docs.npmjs.com/trusted-publishers/). Before the first release, enable GitHub Actions PR creation in repository settings and configure the npm package's trusted GitHub publisher as `boadij/pi-session-inspector`, workflow `release.yml`, allowing direct `npm publish`. No npm token is needed.
+
+To retry publication of an existing release, manually run the **Release** workflow with its `vX.Y.Z` tag.
 
 ## Actions
 
