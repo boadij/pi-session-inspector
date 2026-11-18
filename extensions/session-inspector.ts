@@ -1,8 +1,12 @@
-import { readFileSync } from "node:fs";
+import { constants, readFileSync, type Stats } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import {
+  CURRENT_SESSION_VERSION,
+  getAgentDir,
   migrateSessionEntries,
   parseSessionEntries,
   SessionManager,
@@ -18,6 +22,8 @@ const TOOL_NAME = "session_inspect";
 const DEFAULT_LIMIT = 20;
 const DEFAULT_MAX_CHARS = 700;
 const HARD_OUTPUT_CHARS = 30_000;
+// Bulk scans read at most 128 MiB per invocation, including failed reads.
+const MAX_SCAN_BYTES = 128 * 1024 * 1024;
 
 type Scope = "branch" | "all" | "context";
 type Action =
@@ -649,6 +655,26 @@ function fitPayload(payload: Record<string, unknown>): Record<string, unknown> {
       : { truncated: true, note: `Output exceeded ${HARD_OUTPUT_CHARS} characters.` };
   }
 
+  if (payload.history && payload.coverage) {
+    const coverage = { ...(payload.coverage as HistoryCoverage) };
+    const failures = Array.isArray(payload.failures) ? [...payload.failures] : [];
+    // An exact provenance field can be huge. Skip impossible records before serializing.
+    const examples = records.filter((record) => Object.values(record).every(
+      (value) => typeof value !== "string" || value.length <= HARD_OUTPUT_CHARS,
+    ));
+    const copy = { ...payload, records: examples, coverage, failures };
+    for (;;) {
+      coverage.returned = examples.length;
+      coverage.examplesTruncated = examples.length < coverage.matchingOccurrences;
+      if (JSON.stringify(copy).length <= HARD_OUTPUT_CHARS) return copy;
+      // Keep one explanation for incomplete coverage ahead of matching examples.
+      if (failures.length > 1) failures.pop();
+      else if (examples.length) examples.pop();
+      else if (failures.length) failures.pop();
+      else throw new Error("Historical query metadata exceeds the output cap; use a shorter tool name or history path.");
+    }
+  }
+
   const total = typeof payload.total === "number" ? payload.total : records.length;
   const fromEnd = payload.action !== "branches";
   const copy: Record<string, unknown> = { ...payload, records };
@@ -690,7 +716,10 @@ function resultDetails(
   if (typeof payload.error === "string") {
     details.error = clip(payload.error, 240);
   }
-  if (Array.isArray(payload.records)) {
+  if (payload.history && payload.coverage) {
+    const { attempted, discovered, matchingOccurrences, returned } = payload.coverage as HistoryCoverage;
+    details.summary = `${attempted}/${discovered} sessions attempted · ${matchingOccurrences} matching calls · ${returned} shown${payload.nextCursor ? " · more" : ""}`;
+  } else if (Array.isArray(payload.records)) {
     const returned = typeof payload.returned === "number" ? payload.returned : payload.records.length;
     const total = typeof payload.total === "number" ? payload.total : returned;
     details.returned = returned;
@@ -733,12 +762,300 @@ function loadHistorical(path: string): SessionManager {
   return SessionManager.inMemory(header.cwd || process.cwd(), { id: header.id }, entries);
 }
 
+type HistoryScope = "project" | "all-projects";
+type HistoryCursor = { version: 1; history: HistoryScope; tool: string; root: string; after: string };
+type HistoryCoverage = {
+  discovered: number;
+  attempted: number;
+  scanned: number;
+  failed: number;
+  matchingOccurrences: number;
+  returned: number;
+  scanComplete: boolean;
+  examplesTruncated: boolean;
+};
+type HistoryCandidate = { path: string; directory: Stats };
+
+function compareHistoryPaths(a: string, b: string): number {
+  const aName = basename(a);
+  const bName = basename(b);
+  return aName > bName ? -1 : aName < bName ? 1 : a < b ? -1 : a > b ? 1 : 0;
+}
+
+function decodeHistoryCursor(token: string, history: HistoryScope, tool: string, root: string): string {
+  try {
+    if (token.length > HARD_OUTPUT_CHARS || !/^[A-Za-z0-9_-]+$/.test(token)) throw new Error();
+    const bytes = Buffer.from(token, "base64url");
+    if (bytes.toString("base64url") !== token) throw new Error();
+    const cursor = JSON.parse(bytes.toString("utf8")) as HistoryCursor;
+    const after = cursor.after;
+    if (cursor.version !== 1 || cursor.history !== history || cursor.tool !== tool || cursor.root !== root ||
+        typeof after !== "string" || after.includes("\0") || resolve(after) !== after || !after.endsWith(".jsonl") ||
+        (history === "project" ? dirname(after) : dirname(dirname(after))) !== root) throw new Error();
+    return after;
+  } catch {
+    throw new Error("Invalid history cursor; use nextCursor from the same history, tool, and session root, or restart without it.");
+  }
+}
+
+function sameHistoryInode(a: Stats, b: Stats): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+function sameHistoryFile(a: Stats, b: Stats): boolean {
+  return b.isFile() && sameHistoryInode(a, b) && a.size === b.size &&
+    a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+}
+
+async function assertHistoryDirectory(path: string, expected: Stats) {
+  const current = await lstat(path);
+  if (!current.isDirectory() || !sameHistoryInode(expected, current) || await realpath(path) !== path) {
+    throw new Error("session directory changed or is symlinked");
+  }
+}
+
+async function historyFileStat(candidate: HistoryCandidate): Promise<Stats> {
+  const parent = dirname(candidate.path);
+  await assertHistoryDirectory(parent, candidate.directory);
+  const info = await lstat(candidate.path);
+  await assertHistoryDirectory(parent, candidate.directory);
+  if (!info.isFile()) throw new Error("not an ordinary session file");
+  return info;
+}
+
+async function scanHistoryFile(
+  candidate: HistoryCandidate, before: Stats, cwd: string | undefined, tool: string, limit: number,
+  argumentChars: number | undefined, charge: (bytes: number) => void, signal?: AbortSignal,
+) {
+  const path = candidate.path;
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    if (!sameHistoryFile(before, await handle.stat()) || !sameHistoryFile(before, await historyFileStat(candidate))) {
+      throw new Error("session changed before scanning");
+    }
+    if (!before.size) throw new Error("missing session header");
+    signal?.throwIfAborted();
+
+    // Never read beyond the initial size, even if a writer appends to this inode.
+    const input = handle.createReadStream({ end: before.size - 1, autoClose: false, signal });
+    const closed = new Promise<void>((done) => input.once("close", done));
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    let readError: Error | undefined;
+    input.on("error", (error) => {
+      readError = error;
+      lines.close();
+    });
+    let header: Extract<FileEntry, { type: "session" }> | undefined;
+    let legacy: FileEntry[] | undefined;
+    let outsideProject = false;
+    let matchCount = 0;
+    const records: ToolRecord[] = [];
+    const retained = new Map<string, ToolRecord>();
+    const consume = (entry: SessionEntry) => {
+      if (entry.type !== "message") return;
+      const message = entry.message;
+      if (!message || typeof message.role !== "string") throw new Error("invalid session message");
+      if (message.role === "assistant") {
+        if (!Array.isArray(message.content)) throw new Error("invalid assistant content");
+        for (const call of toolCallsFromMessage(message)) {
+          if (typeof call.name !== "string" || typeof call.id !== "string" || !call.id) throw new Error("invalid tool call");
+          if (call.name !== tool) continue;
+          matchCount++;
+          if (records.length === limit) {
+            const evicted = records.shift()!;
+            if (retained.get(evicted.callId) === evicted) retained.delete(evicted.callId);
+          }
+          const record: ToolRecord = {
+            sessionId: header!.id,
+            sessionPath: path,
+            parentSession: header!.parentSession ?? null,
+            entryId: entry.id,
+            callId: call.id,
+            tool,
+            ts: iso(message.timestamp ?? entry.timestamp),
+            status: "pending",
+          };
+          if (argumentChars !== undefined) record.arguments = boundedJson(call.arguments, argumentChars);
+          records.push(record);
+          retained.set(call.id, record);
+        }
+      } else if (message.role === "toolResult" && message.toolName === tool) {
+        const record = retained.get(message.toolCallId);
+        if (record) {
+          if (typeof message.isError !== "boolean") throw new Error("invalid tool result status");
+          record.resultEntryId = entry.id;
+          record.status = message.isError ? "error" : "ok";
+        }
+      }
+    };
+
+    try {
+      for await (const line of lines) {
+        signal?.throwIfAborted();
+        if (!line.trim()) continue;
+        let entry: FileEntry;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          throw new Error("malformed JSONL");
+        }
+        if (!entry || typeof entry.type !== "string") throw new Error("invalid session entry");
+        if (!header) {
+          if (entry.type !== "session" || typeof entry.id !== "string" || !entry.id.trim() ||
+              typeof entry.cwd !== "string" || !isAbsolute(entry.cwd) ||
+              (entry.parentSession != null && typeof entry.parentSession !== "string")) {
+            throw new Error("invalid session header");
+          }
+          const version = entry.version === undefined ? 1 : entry.version;
+          if (!Number.isInteger(version) || version < 1 || version > CURRENT_SESSION_VERSION) {
+            throw new Error("unsupported session version");
+          }
+          header = entry;
+          if (cwd !== undefined && resolve(header.cwd) !== cwd) {
+            outsideProject = true;
+            break;
+          }
+          if (version < CURRENT_SESSION_VERSION) legacy = [header];
+        } else {
+          if (entry.type === "session" ||
+              ((header.version ?? 1) >= 2 && (typeof entry.id !== "string" || !entry.id))) {
+            throw new Error("invalid session entry");
+          }
+          if (legacy) legacy.push(entry);
+          else consume(entry);
+        }
+      }
+      signal?.throwIfAborted();
+      if (readError) throw new Error("session read failed");
+      if (!header) throw new Error("missing session header");
+      if (legacy) {
+        migrateSessionEntries(legacy);
+        for (const entry of legacy) {
+          signal?.throwIfAborted();
+          if (entry.type !== "session") consume(entry);
+        }
+      }
+      if ((!outsideProject && input.bytesRead !== before.size) ||
+          !sameHistoryFile(before, await handle.stat()) || !sameHistoryFile(before, await historyFileStat(candidate))) {
+        throw new Error("session changed during scanning");
+      }
+      return outsideProject ? undefined : { matchCount, records };
+    } finally {
+      const reachedEof = input.readableEnded;
+      lines.close();
+      input.destroy();
+      await closed;
+      // Destroy can discard one in-flight read without adding it to bytesRead.
+      // On early exit, charge for that possible read as well, within the file cap.
+      charge(Math.min(before.size, input.bytesRead + (reachedEof ? 0 : input.readableHighWaterMark)));
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+async function inspectHistoricalTools(
+  history: HistoryScope, tool: string, configuredRoot: string, cwd: string,
+  cursor: string | undefined, sessionLimit: number, limit: number, argumentChars: number | undefined,
+  signal?: AbortSignal,
+) {
+  signal?.throwIfAborted();
+  const failures: { path: string; reason: string }[] = [];
+  const diagnose = (path: string, reason: string) => {
+    if (failures.length < 5) failures.push({ path: clip(path, 400), reason: clip(reason, 160) });
+  };
+  let discoveryComplete = true;
+  let root = configuredRoot;
+  let rootMayBeMissing = false;
+  try {
+    root = await realpath(configuredRoot);
+  } catch (error) {
+    rootMayBeMissing = (error as NodeJS.ErrnoException).code === "ENOENT";
+    if (!rootMayBeMissing) {
+      discoveryComplete = false;
+      diagnose(configuredRoot, "session root unavailable");
+    }
+  }
+  const after = cursor === undefined ? undefined : decodeHistoryCursor(cursor, history, tool, root);
+  const files: HistoryCandidate[] = [];
+  async function discover(directory: string, projects: boolean, allowMissing = false) {
+    signal?.throwIfAborted();
+    try {
+      const info = await lstat(directory).catch((error: NodeJS.ErrnoException) => {
+        if (allowMissing && error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (!info) return;
+      await assertHistoryDirectory(directory, info);
+      const children = await readdir(directory, { withFileTypes: true });
+      await assertHistoryDirectory(directory, info);
+      for (const child of children) {
+        signal?.throwIfAborted();
+        const path = join(directory, child.name);
+        if (projects && child.isDirectory()) {
+          await discover(path, false);
+        } else if (!projects && child.name.endsWith(".jsonl") && child.isFile()) {
+          files.push({ path, directory: info });
+        } else if ((projects && child.isSymbolicLink()) || (!projects && child.name.endsWith(".jsonl"))) {
+          discoveryComplete = false;
+          diagnose(path, "skipped non-ordinary session candidate or symlink");
+        }
+      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      discoveryComplete = false;
+      diagnose(directory, "session directory unavailable");
+    }
+  }
+  if (discoveryComplete) await discover(root, history === "all-projects", rootMayBeMissing);
+  files.sort((a, b) => compareHistoryPaths(a.path, b.path));
+  const candidates = after === undefined ? files : files.filter(({ path }) => compareHistoryPaths(path, after) > 0);
+  const coverage: HistoryCoverage = {
+    discovered: files.length, attempted: 0, scanned: 0, failed: 0, matchingOccurrences: 0,
+    returned: 0, scanComplete: false, examplesTruncated: false,
+  };
+  const records: ToolRecord[] = [];
+  let remaining = MAX_SCAN_BYTES;
+  for (const candidate of candidates) {
+    signal?.throwIfAborted();
+    if (coverage.attempted >= sessionLimit || remaining === 0) break;
+    try {
+      const before = await historyFileStat(candidate);
+      if (before.size <= MAX_SCAN_BYTES && before.size > remaining) break;
+      if (before.size > MAX_SCAN_BYTES) throw new Error("session exceeds the 128 MiB scan budget");
+      const scanned = await scanHistoryFile(
+        candidate, before, history === "project" ? cwd : undefined, tool, limit, argumentChars,
+        (bytes) => { remaining -= bytes; }, signal,
+      );
+      if (scanned) {
+        coverage.scanned++;
+        coverage.matchingOccurrences += scanned.matchCount;
+        const room = limit - records.length;
+        if (room) records.push(...scanned.records.slice(-room));
+      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      coverage.failed++;
+      diagnose(candidate.path, (error as NodeJS.ErrnoException)?.code ? "session file unavailable" :
+        error instanceof Error ? error.message : "session scan failed");
+    }
+    coverage.attempted++;
+  }
+  signal?.throwIfAborted();
+  const more = coverage.attempted < candidates.length;
+  coverage.scanComplete = !more && discoveryComplete && coverage.failed === 0;
+  const nextCursor = more ? Buffer.from(JSON.stringify({
+    version: 1, history, tool, root, after: candidates[coverage.attempted - 1].path,
+  } satisfies HistoryCursor)).toString("base64url") : undefined;
+  return { action: "tools", history, tool, coverage, nextCursor, records, failures };
+}
+
 export default function sessionInspector(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL_NAME,
     label: "Session Inspect",
     description:
-      "Efficiently inspect the current Pi session, or a historical Pi session by exact session ID or .jsonl path, without dumping raw JSONL. Returns bounded structured evidence for summaries, timelines, tools, errors, searches, branches, or individual entries.",
+      "Efficiently inspect the current Pi session, or a historical Pi session by exact session ID or .jsonl path, without dumping raw JSONL. Returns bounded structured evidence for summaries, timelines, tools, errors, searches, branches, or individual entries. Use action=tools with history and an exact tool name to query historical calls across sessions.",
     promptSnippet: "Inspect Pi sessions with bounded, branch-aware structured output",
     promptGuidelines: [
       "session_inspect: start analysis with action=summary, then narrow to targeted evidence.",
@@ -749,6 +1066,11 @@ export default function sessionInspector(pi: ExtensionAPI) {
     parameters: Type.Object({
       action: StringEnum(["summary", "timeline", "tools", "errors", "search", "branches", "entry"] as const),
       scope: Type.Optional(StringEnum(["branch", "all", "context"] as const)),
+      history: Type.Optional(StringEnum(["project", "all-projects"] as const)),
+      tool: Type.Optional(Type.String({ description: "Exact case-sensitive tool name for a history query." })),
+      sessionLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      cursor: Type.Optional(Type.String()),
+      includeArguments: Type.Optional(Type.Boolean()),
       session: Type.Optional(
         Type.String({
           description:
@@ -790,7 +1112,7 @@ export default function sessionInspector(pi: ExtensionAPI) {
       }
       return new Text(contentText(result.content), 0, 0);
     },
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const action = params.action as Action;
       const scope = (params.scope ?? "branch") as Scope;
       const limit = params.limit ?? DEFAULT_LIMIT;
@@ -799,6 +1121,25 @@ export default function sessionInspector(pi: ExtensionAPI) {
       let source = "active";
 
       try {
+        if (params.history !== undefined) {
+          if (params.history !== "project" && params.history !== "all-projects") throw new Error("history must be project or all-projects");
+          if (action !== "tools") throw new Error("history requires action=tools");
+          if (params.session !== undefined) throw new Error("history cannot be combined with a session selector");
+          if (params.scope !== undefined && params.scope !== "all") throw new Error("history requires scope=all or no explicit scope");
+          if (!params.tool?.trim()) throw new Error("history requires a nonempty exact tool name");
+          if (params.tool.length >= HARD_OUTPUT_CHARS) throw new Error("Historical tool name exceeds the output cap");
+          const root = params.history === "project" ? manager.getSessionDir() : join(getAgentDir(), "sessions");
+          if (!root) throw new Error("No project session directory is configured");
+          const fitted = fitPayload(await inspectHistoricalTools(
+            params.history, params.tool, resolve(ctx.cwd, root), resolve(ctx.cwd),
+            params.cursor, params.sessionLimit ?? 25, limit, params.includeArguments ? maxChars : undefined, signal,
+          ));
+          return {
+            content: [{ type: "text", text: JSON.stringify(fitted) }],
+            details: resultDetails(action, "all", params.history, fitted),
+          };
+        }
+
         if (params.session) {
           const isPath =
             params.session.includes("/") ||
@@ -879,6 +1220,7 @@ export default function sessionInspector(pi: ExtensionAPI) {
           details: resultDetails(action, scope, source, fitted),
         };
       } catch (error) {
+        if (params.history !== undefined) signal?.throwIfAborted();
         const message = error instanceof Error ? error.message : String(error);
         const payload = { error: message };
         return {
