@@ -349,15 +349,20 @@ test("queries bounded historical tool evidence across sessions without rewriting
       originals.set(path, original);
       return path;
     }
-    const abandoned = assistant("copied-entry", null, call("copied-call"), call("not-exact", "Delegate_agent"));
+    const largeCallId = "large-" + "x".repeat(16_000);
+    const abandoned = assistant("copied-entry", null, call("copied-call"), call("not-exact", "Delegate_agent"),
+      call(largeCallId, "large_tool"));
     const ok = result("ok-entry", abandoned.id, "copied-call", false);
     const branch = assistant("other-branch", abandoned.id, call("error-call"), call("pending-call"), call("self-call", "session_inspect"));
     const parent = writeSession("60.jsonl", "original", [
       abandoned, ok, branch, result("error-entry", branch.id, "error-call", true),
       result("orphan-result", branch.id, "orphan-call", false),
+      assistant("unfittable-entry", branch.id, call("x".repeat(31_000), "unfittable_tool")),
       assistant("many-calls", branch.id, ...Array.from({ length: 47 }, (_, i) => call(`many-${i}`))),
     ]);
-    writeSession("50.jsonl", "fork", [abandoned, ok], { parentSession: parent });
+    writeSession("50.jsonl", "fork", [abandoned, ok,
+      assistant("small-entry", ok.id, call("small", "unfittable_tool")),
+    ], { parentSession: parent });
     writeSession("30.jsonl", "malformed", [abandoned, "{bad json"]);
     const oversized = join(project, "40.jsonl");
     writeFileSync(oversized, "");
@@ -401,6 +406,31 @@ test("queries bounded historical tool evidence across sessions without rewriting
     assert.equal(sampled.coverage.examplesTruncated, true);
     assert.deepEqual(new Set(sampled.records.map((record: { callId: string }) => record.callId)), new Set(["many-45", "many-46"]));
 
+    const limited = await query({ sessionLimit: 3, limit: 1 });
+    assert.equal(limited.coverage.matchingOccurrences, 50, "example limit must not advance past an unrepresented fork");
+    assert.equal(limited.records[0].sessionId, "original");
+    assert.ok(limited.nextCursor);
+    const limitedNext = await query({ cursor: limited.nextCursor, sessionLimit: 1, limit: 1 });
+    assert.equal(limitedNext.records[0].sessionId, "fork");
+
+    const largePage = await query({ tool: "large_tool", limit: 50 });
+    assert.equal(largePage.coverage.attempted, 2);
+    assert.equal(largePage.coverage.scanned, 1, "hard cap must not advance past an unrepresented fork");
+    assert.equal(largePage.coverage.matchingOccurrences, 1);
+    assert.deepEqual(largePage.records.map((record: { sessionId: string }) => record.sessionId), ["original"]);
+    assert.ok(largePage.nextCursor);
+    const largeNext = await query({ tool: "large_tool", cursor: largePage.nextCursor });
+    assert.deepEqual(largeNext.records.map((record: { sessionId: string }) => record.sessionId), ["fork"]);
+
+    const impossible = await query({ tool: "unfittable_tool", sessionLimit: 1 });
+    assert.equal(impossible.coverage.scanned, 0);
+    assert.equal(impossible.coverage.matchingOccurrences, 0);
+    assert.equal(impossible.coverage.failed, 1);
+    assert.match(JSON.stringify(impossible.failures), /no sampled example fits/);
+    assert.ok(impossible.nextCursor);
+    const afterImpossible = await query({ tool: "unfittable_tool", cursor: impossible.nextCursor, sessionLimit: 1 });
+    assert.deepEqual(afterImpossible.records.map((record: { sessionId: string }) => record.sessionId), ["fork"]);
+
     const trimmedResult = await request({ sessionLimit: 3, limit: 50, maxChars: 2_000, includeArguments: true });
     const trimmed = output(trimmedResult);
     assert.ok((trimmedResult.content[0]?.text ?? "").length <= 30_000);
@@ -416,6 +446,7 @@ test("queries bounded historical tool evidence across sessions without rewriting
     assert.ok(!JSON.stringify(trimmed).includes(secret));
     assert.doesNotMatch(JSON.stringify(trimmed), /private-result-body/);
     assert.ok(trimmed.nextCursor);
+    assert.deepEqual(new Set(trimmed.records.map((record: { sessionId: string }) => record.sessionId)), new Set(["original", "fork"]));
 
     const second = await query({ cursor: first.nextCursor, sessionLimit: 2 });
     assert.deepEqual(second.coverage, {

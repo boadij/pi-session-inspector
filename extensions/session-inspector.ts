@@ -646,7 +646,11 @@ function recordsPayload(base: Record<string, unknown>, records: unknown[], limit
   };
 }
 
-function fitPayload(payload: Record<string, unknown>): Record<string, unknown> {
+function historyExampleCanFit(record: ToolRecord): boolean {
+  return Object.values(record).every((value) => typeof value !== "string" || value.length <= HARD_OUTPUT_CHARS);
+}
+
+function fitPayload(payload: Record<string, unknown>, required = new Set<ToolRecord>()): Record<string, unknown> {
   const records = Array.isArray(payload.records) ? [...payload.records] : undefined;
   if (!records) {
     const text = JSON.stringify(payload);
@@ -659,17 +663,16 @@ function fitPayload(payload: Record<string, unknown>): Record<string, unknown> {
     const coverage = { ...(payload.coverage as HistoryCoverage) };
     const failures = Array.isArray(payload.failures) ? [...payload.failures] : [];
     // An exact provenance field can be huge. Skip impossible records before serializing.
-    const examples = records.filter((record) => Object.values(record).every(
-      (value) => typeof value !== "string" || value.length <= HARD_OUTPUT_CHARS,
-    ));
+    const examples = (records as ToolRecord[]).filter(historyExampleCanFit);
     const copy = { ...payload, records: examples, coverage, failures };
     for (;;) {
       coverage.returned = examples.length;
       coverage.examplesTruncated = examples.length < coverage.matchingOccurrences;
       if (JSON.stringify(copy).length <= HARD_OUTPUT_CHARS) return copy;
-      // Keep one explanation for incomplete coverage ahead of matching examples.
+      // Keep one example per matching session; retain a diagnostic before optional examples.
+      const optional = examples.findLastIndex((record) => !required.has(record));
       if (failures.length > 1) failures.pop();
-      else if (examples.length) examples.pop();
+      else if (optional >= 0) examples.splice(optional, 1);
       else if (failures.length) failures.pop();
       else throw new Error("Historical query metadata exceeds the output cap; use a shorter tool name or history path.");
     }
@@ -1015,39 +1018,85 @@ async function inspectHistoricalTools(
     returned: 0, scanComplete: false, examplesTruncated: false,
   };
   const records: ToolRecord[] = [];
+  const required = new Set<ToolRecord>();
   let remaining = MAX_SCAN_BYTES;
+  let advanced = 0;
+  let nextCursor: string | undefined;
+  const page = (counts: HistoryCoverage, cursor: string | undefined, examples: ToolRecord[], diagnostics = failures) => ({
+    action: "tools", history, tool, coverage: counts, nextCursor: cursor, records: examples, failures: diagnostics,
+  });
+
   for (const candidate of candidates) {
     signal?.throwIfAborted();
-    if (coverage.attempted >= sessionLimit || remaining === 0) break;
+    if (coverage.attempted >= sessionLimit || required.size >= limit || remaining === 0) break;
+    let scanned: Awaited<ReturnType<typeof scanHistoryFile>>;
+    let failure: string | undefined;
     try {
       const before = await historyFileStat(candidate);
       if (before.size <= MAX_SCAN_BYTES && before.size > remaining) break;
       if (before.size > MAX_SCAN_BYTES) throw new Error("session exceeds the 128 MiB scan budget");
-      const scanned = await scanHistoryFile(
+      scanned = await scanHistoryFile(
         candidate, before, history === "project" ? cwd : undefined, tool, limit, argumentChars,
         (bytes) => { remaining -= bytes; }, signal,
       );
-      if (scanned) {
-        coverage.scanned++;
-        coverage.matchingOccurrences += scanned.matchCount;
-        const room = limit - records.length;
-        if (room) records.push(...scanned.records.slice(-room));
-      }
     } catch (error) {
       signal?.throwIfAborted();
-      coverage.failed++;
-      diagnose(candidate.path, (error as NodeJS.ErrnoException)?.code ? "session file unavailable" :
-        error instanceof Error ? error.message : "session scan failed");
+      failure = (error as NodeJS.ErrnoException)?.code ? "session file unavailable" :
+        error instanceof Error ? error.message : "session scan failed";
     }
     coverage.attempted++;
+    const cursor = advanced + 1 < candidates.length ? Buffer.from(JSON.stringify({
+      version: 1, history, tool, root, after: candidate.path,
+    } satisfies HistoryCursor)).toString("base64url") : undefined;
+    const representatives = [...required];
+    const fits = (examples: ToolRecord[]) => JSON.stringify(page({
+      ...coverage,
+      // Reserve space for an attempted but deferred file.
+      attempted: sessionLimit,
+      scanned: coverage.scanned + Number(scanned !== undefined),
+      failed: coverage.failed + Number(failure !== undefined),
+      matchingOccurrences: coverage.matchingOccurrences + (scanned?.matchCount ?? 0),
+      returned: examples.length,
+      examplesTruncated: false,
+    }, cursor, examples, [])).length <= HARD_OUTPUT_CHARS;
+
+    let representative: ToolRecord | undefined;
+    if (scanned?.matchCount) {
+      representative = scanned.records.findLast((record) =>
+        historyExampleCanFit(record) && fits([...representatives, record]));
+      if (!representative) {
+        if (advanced > 0) break;
+        // A file that cannot fit even on its own page must not stall pagination.
+        failure = "no sampled example fits the output cap; inspect this session directly";
+        scanned = undefined;
+      }
+    }
+    if (!representative && !fits(representatives)) {
+      if (advanced > 0) break;
+      throw new Error("Historical query metadata exceeds the output cap; use a shorter tool name or history path.");
+    }
+
+    if (failure) {
+      coverage.failed++;
+      diagnose(candidate.path, failure);
+    } else if (scanned) {
+      coverage.scanned++;
+      coverage.matchingOccurrences += scanned.matchCount;
+      if (representative) {
+        if (records.length === limit) records.splice(records.findIndex((record) => !required.has(record)), 1);
+        required.add(representative);
+        const extras = scanned.records.filter((record) => record !== representative && historyExampleCanFit(record));
+        const room = limit - records.length - 1;
+        if (room > 0) records.push(...extras.slice(-room));
+        records.push(representative);
+      }
+    }
+    advanced++;
+    nextCursor = cursor;
   }
   signal?.throwIfAborted();
-  const more = coverage.attempted < candidates.length;
-  coverage.scanComplete = !more && discoveryComplete && coverage.failed === 0;
-  const nextCursor = more ? Buffer.from(JSON.stringify({
-    version: 1, history, tool, root, after: candidates[coverage.attempted - 1].path,
-  } satisfies HistoryCursor)).toString("base64url") : undefined;
-  return { action: "tools", history, tool, coverage, nextCursor, records, failures };
+  coverage.scanComplete = advanced === candidates.length && discoveryComplete && coverage.failed === 0;
+  return fitPayload(page(coverage, nextCursor, records), required);
 }
 
 export default function sessionInspector(pi: ExtensionAPI) {
@@ -1130,10 +1179,10 @@ export default function sessionInspector(pi: ExtensionAPI) {
           if (params.tool.length >= HARD_OUTPUT_CHARS) throw new Error("Historical tool name exceeds the output cap");
           const root = params.history === "project" ? manager.getSessionDir() : join(getAgentDir(), "sessions");
           if (!root) throw new Error("No project session directory is configured");
-          const fitted = fitPayload(await inspectHistoricalTools(
+          const fitted = await inspectHistoricalTools(
             params.history, params.tool, resolve(ctx.cwd, root), resolve(ctx.cwd),
             params.cursor, params.sessionLimit ?? 25, limit, params.includeArguments ? maxChars : undefined, signal,
-          ));
+          );
           return {
             content: [{ type: "text", text: JSON.stringify(fitted) }],
             details: resultDetails(action, "all", params.history, fitted),
