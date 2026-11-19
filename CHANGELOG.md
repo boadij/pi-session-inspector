@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/boadij/pi-session-inspector/compare/v0.2.0...v0.3.0) (2026-11-19)
+
+
+### Features
+
+* **inspector:** filter historical sessions by cwd prefixes ([#8](https://github.com/boadij/pi-session-inspector/issues/8)) ([6f17235](https://github.com/boadij/pi-session-inspector/commit/6f172356c29773b20431077d8cb978bd1934516c))
+
 ## [0.2.0](https://github.com/boadij/pi-session-inspector/compare/v0.1.0...v0.2.0) (2026-11-18)
 
 
