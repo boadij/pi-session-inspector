@@ -375,7 +375,22 @@ test("queries bounded historical tool evidence across sessions without rewriting
     writeSession("20.jsonl", "legacy", [{ type: "message", message: {
       role: "assistant", content: [call("legacy-call")], timestamp,
     } }], { version: 1 });
-    writeSession("70.jsonl", "other", [assistant("other-entry", null, call("other-call"))], { cwd: otherCwd }, other);
+    writeSession("70.jsonl", "other", [
+      assistant("other-entry", null, call("other-call"), call("script-call", "codemode")),
+      entry("script-result", "other-entry", {
+        role: "toolResult", toolCallId: "script-call", toolName: "codemode", isError: false,
+        content: [], timestamp,
+        nestedCalls: {
+          complete: false,
+          calls: [
+            { id: "script-call/1", name: "delegate_agent", status: "ok", arguments: { task: "nested task", token: secret } },
+            { id: "script-call/2", name: "delegate_agent", status: "error", arguments: { task: "failed task" } },
+            { id: "script-call/3", name: "delegate_agent", status: "unfinished", argumentsBytes: 12_000 },
+            { id: "script-call/4", name: "continue_agent", status: "ok", arguments: { task: "continue work" } },
+          ],
+        },
+      }),
+    ], { cwd: otherCwd }, other);
     writeSession("12.jsonl", "former", [assistant("former-entry", null, call("former-call"))], { cwd: formerWorktree }, formerSessions);
     writeSession("11.jsonl", "backup", [assistant("backup-entry", null, call("backup-call"))], { cwd: similarlyNamed }, backupSessions);
 
@@ -483,8 +498,37 @@ test("queries bounded historical tool evidence across sessions without rewriting
     assert.match((await query({ tool: " " })).error, /tool/i);
     const all = await query({ history: "all-projects", sessionLimit: 1 });
     assert.equal(all.coverage.discovered, 8);
-    assert.equal(all.coverage.matchingOccurrences, 1);
+    assert.equal(all.coverage.matchingOccurrences, 4);
     assert.equal(all.records[0].sessionId, "other");
+
+    const otherCtx = {
+      cwd: otherCwd, sessionManager: { getSessionDir: () => other },
+    } as unknown as ExtensionContext;
+    const nested = output(await definition.execute("nested-history", {
+      action: "tools", history: "project", tool: "delegate_agent", includeArguments: true,
+    }, undefined, undefined, otherCtx));
+    assert.equal(nested.coverage.matchingOccurrences, 4);
+    assert.equal(nested.coverage.incompleteNestedResults, 1);
+    assert.equal(nested.coverage.scanComplete, true, "complete file scan does not establish complete nested metadata");
+    assert.deepEqual(nested.records.map((record: { status: string }) => record.status),
+      ["pending", "ok", "error", "unfinished"]);
+    const recordedNested = nested.records.filter((record: { source?: string }) => record.source === "nested");
+    assert.equal(recordedNested.length, 3);
+    assert.ok(recordedNested.every((record: { entryId: string; parentCallId: string }) =>
+      record.entryId === "script-result" && record.parentCallId === "script-call"));
+    assert.match(recordedNested[0].arguments, /REDACTED_KEY/);
+    assert.equal(recordedNested[2].argumentsUnavailable, true);
+    assert.equal(recordedNested[2].argumentsBytes, 12_000);
+    assert.doesNotMatch(JSON.stringify(nested), /sk-fixture-example-not-a-real-key/);
+    const continuation = output(await definition.execute("nested-continuation", {
+      action: "tools", history: "project", tool: "continue_agent",
+    }, undefined, undefined, otherCtx));
+    assert.deepEqual(continuation.records.map((record: { callId: string }) => record.callId), ["script-call/4"]);
+    assert.equal(continuation.coverage.incompleteNestedResults, 1);
+    const filteredNested = await query({
+      history: "all-projects", cwdPrefixes: [otherCwd], sessionLimit: 1,
+    });
+    assert.equal(filteredNested.coverage.matchingOccurrences, 4);
 
     const prefixes = [cwd, join(directory, ".herdr", "worktrees", "project")];
     const scoped = async (options: Record<string, unknown> = {}) =>

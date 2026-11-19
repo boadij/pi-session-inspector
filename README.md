@@ -56,6 +56,7 @@ session_inspect(action="tools", history="project", tool="delegate_agent", sessio
 
 - `history="project"` searches the active session manager's configured directory and checks session working directories against the active project. Explicitly use `history="all-projects"` to search local Pi project directories under the Pi agent directory's `sessions` folder. Bulk discovery does not follow symlinked child directories or files.
 - With `history="all-projects"`, optional `cwdPrefixes` restricts matches to sessions whose recorded absolute working directory is one of the supplied absolute paths or a descendant. Paths need not exist now. Prefixes match directory boundaries; relative paths are rejected. Excluded sessions do not consume `sessionLimit`, but header reads count toward the input budget. Filtered queries report `coverage.excluded`.
+- Historical tool searches include both top-level assistant calls and Pi's persisted `nestedCalls` on tool results (including Code Mode). Nested records have `source="nested"`, `parentCallId`, and an `entryId` referring to the enclosing tool-result entry. Stored statuses may be `unfinished`; omitted nested arguments are marked `argumentsUnavailable` when requested.
 - History mode requires `action="tools"` and a nonempty, exact, case-sensitive `tool` name. Do not supply `session`. All recorded branches are searched, including abandoned branches; omit `scope` or set it to `"all"`. The inspector's own calls are excluded. Omitting `history` preserves single-session behavior.
 - `sessionLimit` bounds attempted files (default 25, max 100). `limit` bounds returned examples (default 20, max 50); the output cap may reduce that further. A call has a 128 MiB input budget. Files too large for bulk scanning are skipped and can still be inspected directly by path.
 - Argument excerpts are omitted by default. Set `includeArguments=true` to request bounded, redacted excerpts (`maxChars` still controls excerpt length). Redaction is best-effort and may miss sensitive values. Tool-result bodies are never returned in history mode.
@@ -71,7 +72,8 @@ The response reports coverage separately from examples:
 | `discovered` | Session file candidates found during discovery, including out-of-scope files. |
 | `excluded` | With `cwdPrefixes`, files skipped because their recorded `cwd` was outside the filter. Unreadable headers are failures, not exclusions. |
 | `attempted`, `scanned`, `failed` | Candidates attempted, files counted as fully scanned, and file failures on this page. An attempted file deferred at the output boundary is not counted as scanned or failed and is retried on the next page. Failure diagnostics are bounded. |
-| `matchingOccurrences` | Matching calls in fully scanned files on this page, including copied entries in forks. These are recorded occurrences, not unique executions. |
+| `matchingOccurrences` | Matching top-level and persisted nested calls in fully scanned files on this page, including copied entries in forks. These are recorded occurrences, not unique executions. |
+| `incompleteNestedResults` | Number of scanned tool results whose persisted nested-call metadata is incomplete (when nonzero). Some calls or arguments may be missing even when all session files were scanned. |
 | `returned`, `examplesTruncated` | Examples actually emitted, and whether some matches on this page were omitted. |
 | `scanComplete` | No remaining candidates, complete discovery, and no failures on this page. Check earlier pages separately. |
 

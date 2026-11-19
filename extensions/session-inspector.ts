@@ -777,6 +777,7 @@ type HistoryCoverage = {
   scanComplete: boolean;
   examplesTruncated: boolean;
   excluded?: number;
+  incompleteNestedResults?: number;
 };
 type HistoryCandidate = { path: string; directory: Stats };
 
@@ -859,8 +860,16 @@ async function scanHistoryFile(
     let legacy: FileEntry[] | undefined;
     let outsideProject = false;
     let matchCount = 0;
+    let incompleteNestedResults = 0;
     const records: ToolRecord[] = [];
     const retained = new Map<string, ToolRecord>();
+    const append = (record: ToolRecord) => {
+      if (records.length === limit) {
+        const evicted = records.shift()!;
+        if (retained.get(evicted.callId) === evicted) retained.delete(evicted.callId);
+      }
+      records.push(record);
+    };
     const consume = (entry: SessionEntry) => {
       if (entry.type !== "message") return;
       const message = entry.message;
@@ -871,10 +880,6 @@ async function scanHistoryFile(
           if (typeof call.name !== "string" || typeof call.id !== "string" || !call.id) throw new Error("invalid tool call");
           if (call.name !== tool) continue;
           matchCount++;
-          if (records.length === limit) {
-            const evicted = records.shift()!;
-            if (retained.get(evicted.callId) === evicted) retained.delete(evicted.callId);
-          }
           const record: ToolRecord = {
             sessionId: header!.id,
             sessionPath: path,
@@ -886,15 +891,48 @@ async function scanHistoryFile(
             status: "pending",
           };
           if (argumentChars !== undefined) record.arguments = boundedJson(call.arguments, argumentChars);
-          records.push(record);
+          append(record);
           retained.set(call.id, record);
         }
-      } else if (message.role === "toolResult" && message.toolName === tool) {
-        const record = retained.get(message.toolCallId);
-        if (record) {
-          if (typeof message.isError !== "boolean") throw new Error("invalid tool result status");
-          record.resultEntryId = entry.id;
-          record.status = message.isError ? "error" : "ok";
+      } else if (message.role === "toolResult") {
+        if (message.toolName === tool) {
+          const record = retained.get(message.toolCallId);
+          if (record) {
+            if (typeof message.isError !== "boolean") throw new Error("invalid tool result status");
+            record.resultEntryId = entry.id;
+            record.status = message.isError ? "error" : "ok";
+          }
+        }
+        const nested = message.nestedCalls;
+        if (!nested) return;
+        if (!Array.isArray(nested.calls) || typeof nested.complete !== "boolean" ||
+            typeof message.toolCallId !== "string") throw new Error("invalid nested tool call metadata");
+        if (!nested.complete) incompleteNestedResults++;
+        for (const call of nested.calls) {
+          if (!call || typeof call.id !== "string" || !call.id || typeof call.name !== "string" ||
+              !["ok", "error", "unfinished"].includes(call.status)) throw new Error("invalid nested tool call");
+          if (call.name !== tool || call.name === TOOL_NAME) continue;
+          matchCount++;
+          const record: ToolRecord = {
+            sessionId: header!.id,
+            sessionPath: path,
+            parentSession: header!.parentSession ?? null,
+            entryId: entry.id,
+            callId: call.id,
+            tool,
+            ts: iso(message.timestamp ?? entry.timestamp),
+            status: call.status,
+            source: "nested",
+            parentCallId: message.toolCallId,
+          };
+          if (argumentChars !== undefined) {
+            if (call.arguments !== undefined) record.arguments = boundedJson(call.arguments, argumentChars);
+            else {
+              record.argumentsUnavailable = true;
+              if (typeof call.argumentsBytes === "number") record.argumentsBytes = call.argumentsBytes;
+            }
+          }
+          append(record);
         }
       }
     };
@@ -950,7 +988,7 @@ async function scanHistoryFile(
           !sameHistoryFile(before, await handle.stat()) || !sameHistoryFile(before, await historyFileStat(candidate))) {
         throw new Error("session changed during scanning");
       }
-      return outsideProject ? undefined : { matchCount, records };
+      return outsideProject ? undefined : { matchCount, records, incompleteNestedResults };
     } finally {
       const reachedEof = input.readableEnded;
       lines.close();
@@ -1066,6 +1104,9 @@ async function inspectHistoricalTools(
       scanned: coverage.scanned + Number(scanned !== undefined),
       failed: coverage.failed + Number(failure !== undefined),
       matchingOccurrences: coverage.matchingOccurrences + (scanned?.matchCount ?? 0),
+      ...(scanned?.incompleteNestedResults ? {
+        incompleteNestedResults: (coverage.incompleteNestedResults ?? 0) + scanned.incompleteNestedResults,
+      } : {}),
       returned: examples.length,
       examplesTruncated: false,
     }, cursor, examples, [])).length <= HARD_OUTPUT_CHARS;
@@ -1092,6 +1133,8 @@ async function inspectHistoricalTools(
     } else if (scanned) {
       coverage.scanned++;
       coverage.matchingOccurrences += scanned.matchCount;
+      if (scanned.incompleteNestedResults)
+        coverage.incompleteNestedResults = (coverage.incompleteNestedResults ?? 0) + scanned.incompleteNestedResults;
       if (representative) {
         if (records.length === limit) records.splice(records.findIndex((record) => !required.has(record)), 1);
         required.add(representative);
