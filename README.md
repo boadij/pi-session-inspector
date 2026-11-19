@@ -55,11 +55,12 @@ session_inspect(action="tools", history="project", tool="delegate_agent", sessio
 ```
 
 - `history="project"` searches the active session manager's configured directory and checks session working directories against the active project. Explicitly use `history="all-projects"` to search local Pi project directories under the Pi agent directory's `sessions` folder. Bulk discovery does not follow symlinked child directories or files.
+- With `history="all-projects"`, optional `cwdPrefixes` restricts matches to sessions whose recorded absolute working directory is one of the supplied absolute paths or a descendant. Paths need not exist now. Prefixes match directory boundaries; relative paths are rejected. Excluded sessions do not consume `sessionLimit`, but header reads count toward the input budget. Filtered queries report `coverage.excluded`.
 - History mode requires `action="tools"` and a nonempty, exact, case-sensitive `tool` name. Do not supply `session`. All recorded branches are searched, including abandoned branches; omit `scope` or set it to `"all"`. The inspector's own calls are excluded. Omitting `history` preserves single-session behavior.
 - `sessionLimit` bounds attempted files (default 25, max 100). `limit` bounds returned examples (default 20, max 50); the output cap may reduce that further. A call has a 128 MiB input budget. Files too large for bulk scanning are skipped and can still be inspected directly by path.
 - Argument excerpts are omitted by default. Set `includeArguments=true` to request bounded, redacted excerpts (`maxChars` still controls excerpt length). Redaction is best-effort and may miss sensitive values. Tool-result bodies are never returned in history mode.
 
-Pass `nextCursor` back as `cursor` with the same history scope, tool, and session root to continue with the remaining files. The cursor is opaque and advances by file, not by example. A page keeps at least one example per matching session it counts as scanned, deferring the next session if necessary. Other calls from a represented session are sampled, not individually paginated. If no sampled example fits even on a page of its own, the file is reported as failed and skipped so the cursor can advance. Pagination is not a snapshot: files added, deleted, or modified between pages can affect coverage. An absent cursor means there is no next page, not that all history was readable.
+Pass `nextCursor` back as `cursor` with the same history scope, tool, session root, and optional `cwdPrefixes` filter to continue with the remaining files. The cursor is opaque and advances by file, not by example. A page keeps at least one example per matching session it counts as scanned, deferring the next session if necessary. Other calls from a represented session are sampled, not individually paginated. If no sampled example fits even on a page of its own, the file is reported as failed and skipped so the cursor can advance. Pagination is not a snapshot: files added, deleted, or modified between pages can affect coverage. An absent cursor means there is no next page, not that all history was readable.
 
 Each example identifies the session (`sessionId`, `sessionPath`, `parentSession`), assistant entry (`entryId`), tool call (`callId`), and any correlated result (`resultEntryId`). Status `ok` or `error` reflects Pi's tool-error flag, not whether the tool accomplished its task. `pending` means no correlated result was found in the file, not that the tool is still running.
 
@@ -67,7 +68,8 @@ The response reports coverage separately from examples:
 
 | Field | Meaning |
 | --- | --- |
-| `discovered` | Session file candidates found during discovery. |
+| `discovered` | Session file candidates found during discovery, including out-of-scope files. |
+| `excluded` | With `cwdPrefixes`, files skipped because their recorded `cwd` was outside the filter. Unreadable headers are failures, not exclusions. |
 | `attempted`, `scanned`, `failed` | Candidates attempted, files counted as fully scanned, and file failures on this page. An attempted file deferred at the output boundary is not counted as scanned or failed and is retried on the next page. Failure diagnostics are bounded. |
 | `matchingOccurrences` | Matching calls in fully scanned files on this page, including copied entries in forks. These are recorded occurrences, not unique executions. |
 | `returned`, `examplesTruncated` | Examples actually emitted, and whether some matches on this page were omitted. |
