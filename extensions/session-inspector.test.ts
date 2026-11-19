@@ -558,7 +558,7 @@ test("queries bounded historical tool evidence across sessions without rewriting
     }, undefined, undefined, { cwd: otherCwd, sessionManager: { getSessionDir: () => other } } as unknown as ExtensionContext));
     assert.deepEqual(empty.coverage, {
       discovered: 1, attempted: 1, scanned: 1, failed: 0, matchingOccurrences: 0,
-      returned: 0, scanComplete: true, examplesTruncated: false,
+      returned: 0, scanComplete: true, examplesTruncated: false, incompleteNestedResults: 1,
     });
 
     for (const [path, original] of originals) assert.equal(readFileSync(path, "utf8"), original, path);
