@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { createReadStream, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
@@ -319,9 +319,13 @@ test("queries bounded historical tool evidence across sessions without rewriting
   try {
     const cwd = join(directory, "project");
     const otherCwd = join(directory, "other");
+    const formerWorktree = join(directory, ".herdr", "worktrees", "project", "feat-gone");
+    const similarlyNamed = join(directory, ".herdr", "worktrees", "project-backup", "feat-gone");
     const project = join(agentDir, "sessions", "--project--");
     const other = join(agentDir, "sessions", "--other--");
-    for (const dir of [cwd, otherCwd, project, other]) mkdirSync(dir, { recursive: true });
+    const formerSessions = join(agentDir, "sessions", "--former--");
+    const backupSessions = join(agentDir, "sessions", "--backup--");
+    for (const dir of [cwd, otherCwd, project, other, formerSessions, backupSessions]) mkdirSync(dir, { recursive: true });
     const originals = new Map<string, string>();
     const timestamp = 1_700_000_000_000;
     const secret = "sk-fixture-example-not-a-real-key";
@@ -372,6 +376,8 @@ test("queries bounded historical tool evidence across sessions without rewriting
       role: "assistant", content: [call("legacy-call")], timestamp,
     } }], { version: 1 });
     writeSession("70.jsonl", "other", [assistant("other-entry", null, call("other-call"))], { cwd: otherCwd }, other);
+    writeSession("12.jsonl", "former", [assistant("former-entry", null, call("former-call"))], { cwd: formerWorktree }, formerSessions);
+    writeSession("11.jsonl", "backup", [assistant("backup-entry", null, call("backup-call"))], { cwd: similarlyNamed }, backupSessions);
 
     const ctx = { cwd, sessionManager: { getSessionDir: () => project } } as unknown as ExtensionContext;
     const definition = tool();
@@ -476,9 +482,33 @@ test("queries bounded historical tool evidence across sessions without rewriting
     assert.match((await query({ scope: "branch" })).error, /scope/i);
     assert.match((await query({ tool: " " })).error, /tool/i);
     const all = await query({ history: "all-projects", sessionLimit: 1 });
-    assert.equal(all.coverage.discovered, 6);
+    assert.equal(all.coverage.discovered, 8);
     assert.equal(all.coverage.matchingOccurrences, 1);
     assert.equal(all.records[0].sessionId, "other");
+
+    const prefixes = [cwd, join(directory, ".herdr", "worktrees", "project")];
+    const scoped = async (options: Record<string, unknown> = {}) =>
+      query({ history: "all-projects", cwdPrefixes: prefixes, sessionLimit: 1, limit: 1, ...options });
+    const matched = new Set<string>();
+    let excluded = 0;
+    let cursor: string | undefined;
+    let firstScopedCursor: string | undefined;
+    do {
+      const page = await scoped({ cursor });
+      assert.equal(page.error, undefined);
+      excluded += page.coverage.excluded;
+      for (const record of page.records) matched.add(record.sessionId);
+      cursor = page.nextCursor;
+      firstScopedCursor ??= cursor;
+    } while (cursor);
+    assert.deepEqual(matched, new Set(["original", "fork", "legacy", "former"]));
+    assert.equal(excluded, 2, "out-of-scope session headers do not consume the in-scope page limit");
+    assert.equal(existsSync(formerWorktree), false, "the matching historical checkout no longer exists");
+    assert.match((await scoped({ cursor: firstScopedCursor, cwdPrefixes: [cwd] })).error, /cursor/i);
+    assert.equal((await scoped({ cursor: firstScopedCursor, cwdPrefixes: [...prefixes].reverse() })).error, undefined);
+    assert.match((await scoped({ cwdPrefixes: ["relative"] })).error, /absolute/i);
+    assert.match((await query({ history: "project", cwdPrefixes: prefixes })).error, /all-projects/i);
+
     const empty = output(await definition.execute("history-empty", {
       action: "tools", history: "project", tool: "unrecorded",
     }, undefined, undefined, { cwd: otherCwd, sessionManager: { getSessionDir: () => other } } as unknown as ExtensionContext));

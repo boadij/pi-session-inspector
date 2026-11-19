@@ -1,7 +1,7 @@
 import { constants, readFileSync, type Stats } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { StringEnum, type Usage } from "@earendil-works/pi-ai";
 import {
@@ -766,7 +766,7 @@ function loadHistorical(path: string): SessionManager {
 }
 
 type HistoryScope = "project" | "all-projects";
-type HistoryCursor = { version: 1; history: HistoryScope; tool: string; root: string; after: string };
+type HistoryCursor = { version: 1; history: HistoryScope; tool: string; root: string; after: string; cwdPrefixes?: string[] };
 type HistoryCoverage = {
   discovered: number;
   attempted: number;
@@ -776,6 +776,7 @@ type HistoryCoverage = {
   returned: number;
   scanComplete: boolean;
   examplesTruncated: boolean;
+  excluded?: number;
 };
 type HistoryCandidate = { path: string; directory: Stats };
 
@@ -785,7 +786,12 @@ function compareHistoryPaths(a: string, b: string): number {
   return aName > bName ? -1 : aName < bName ? 1 : a < b ? -1 : a > b ? 1 : 0;
 }
 
-function decodeHistoryCursor(token: string, history: HistoryScope, tool: string, root: string): string {
+function matchesCwdPrefix(cwd: string, prefixes: readonly string[]): boolean {
+  const path = resolve(cwd);
+  return prefixes.some((prefix) => path === prefix || path.startsWith(prefix.endsWith(sep) ? prefix : prefix + sep));
+}
+
+function decodeHistoryCursor(token: string, history: HistoryScope, tool: string, root: string, cwdPrefixes?: string[]): string {
   try {
     if (token.length > HARD_OUTPUT_CHARS || !/^[A-Za-z0-9_-]+$/.test(token)) throw new Error();
     const bytes = Buffer.from(token, "base64url");
@@ -793,6 +799,7 @@ function decodeHistoryCursor(token: string, history: HistoryScope, tool: string,
     const cursor = JSON.parse(bytes.toString("utf8")) as HistoryCursor;
     const after = cursor.after;
     if (cursor.version !== 1 || cursor.history !== history || cursor.tool !== tool || cursor.root !== root ||
+        JSON.stringify(cursor.cwdPrefixes ?? []) !== JSON.stringify(cwdPrefixes ?? []) ||
         typeof after !== "string" || after.includes("\0") || resolve(after) !== after || !after.endsWith(".jsonl") ||
         (history === "project" ? dirname(after) : dirname(dirname(after))) !== root) throw new Error();
     return after;
@@ -827,8 +834,8 @@ async function historyFileStat(candidate: HistoryCandidate): Promise<Stats> {
 }
 
 async function scanHistoryFile(
-  candidate: HistoryCandidate, before: Stats, cwd: string | undefined, tool: string, limit: number,
-  argumentChars: number | undefined, charge: (bytes: number) => void, signal?: AbortSignal,
+  candidate: HistoryCandidate, before: Stats, cwd: string | undefined, cwdPrefixes: string[] | undefined,
+  tool: string, limit: number, argumentChars: number | undefined, charge: (bytes: number) => void, signal?: AbortSignal,
 ) {
   const path = candidate.path;
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
@@ -914,7 +921,8 @@ async function scanHistoryFile(
             throw new Error("unsupported session version");
           }
           header = entry;
-          if (cwd !== undefined && resolve(header.cwd) !== cwd) {
+          if ((cwd !== undefined && resolve(header.cwd) !== cwd) ||
+              (cwdPrefixes !== undefined && !matchesCwdPrefix(header.cwd, cwdPrefixes))) {
             outsideProject = true;
             break;
           }
@@ -960,7 +968,7 @@ async function scanHistoryFile(
 async function inspectHistoricalTools(
   history: HistoryScope, tool: string, configuredRoot: string, cwd: string,
   cursor: string | undefined, sessionLimit: number, limit: number, argumentChars: number | undefined,
-  signal?: AbortSignal,
+  cwdPrefixes?: string[], signal?: AbortSignal,
 ) {
   signal?.throwIfAborted();
   const failures: { path: string; reason: string }[] = [];
@@ -979,7 +987,7 @@ async function inspectHistoricalTools(
       diagnose(configuredRoot, "session root unavailable");
     }
   }
-  const after = cursor === undefined ? undefined : decodeHistoryCursor(cursor, history, tool, root);
+  const after = cursor === undefined ? undefined : decodeHistoryCursor(cursor, history, tool, root, cwdPrefixes);
   const files: HistoryCandidate[] = [];
   async function discover(directory: string, projects: boolean, allowMissing = false) {
     signal?.throwIfAborted();
@@ -1016,6 +1024,7 @@ async function inspectHistoricalTools(
   const coverage: HistoryCoverage = {
     discovered: files.length, attempted: 0, scanned: 0, failed: 0, matchingOccurrences: 0,
     returned: 0, scanComplete: false, examplesTruncated: false,
+    ...(cwdPrefixes ? { excluded: 0 } : {}),
   };
   const records: ToolRecord[] = [];
   const required = new Set<ToolRecord>();
@@ -1036,7 +1045,7 @@ async function inspectHistoricalTools(
       if (before.size <= MAX_SCAN_BYTES && before.size > remaining) break;
       if (before.size > MAX_SCAN_BYTES) throw new Error("session exceeds the 128 MiB scan budget");
       scanned = await scanHistoryFile(
-        candidate, before, history === "project" ? cwd : undefined, tool, limit, argumentChars,
+        candidate, before, history === "project" ? cwd : undefined, cwdPrefixes, tool, limit, argumentChars,
         (bytes) => { remaining -= bytes; }, signal,
       );
     } catch (error) {
@@ -1044,9 +1053,10 @@ async function inspectHistoricalTools(
       failure = (error as NodeJS.ErrnoException)?.code ? "session file unavailable" :
         error instanceof Error ? error.message : "session scan failed";
     }
-    coverage.attempted++;
+    if (cwdPrefixes && !failure && !scanned) coverage.excluded!++;
+    else coverage.attempted++;
     const cursor = advanced + 1 < candidates.length ? Buffer.from(JSON.stringify({
-      version: 1, history, tool, root, after: candidate.path,
+      version: 1, history, tool, root, after: candidate.path, ...(cwdPrefixes ? { cwdPrefixes } : {}),
     } satisfies HistoryCursor)).toString("base64url") : undefined;
     const representatives = [...required];
     const fits = (examples: ToolRecord[]) => JSON.stringify(page({
@@ -1116,6 +1126,7 @@ export default function sessionInspector(pi: ExtensionAPI) {
       action: StringEnum(["summary", "timeline", "tools", "errors", "search", "branches", "entry"] as const),
       scope: Type.Optional(StringEnum(["branch", "all", "context"] as const)),
       history: Type.Optional(StringEnum(["project", "all-projects"] as const)),
+      cwdPrefixes: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 16 })),
       tool: Type.Optional(Type.String({ description: "Exact case-sensitive tool name for a history query." })),
       sessionLimit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       cursor: Type.Optional(Type.String()),
@@ -1170,6 +1181,13 @@ export default function sessionInspector(pi: ExtensionAPI) {
       let source = "active";
 
       try {
+        if (params.cwdPrefixes !== undefined && params.history !== "all-projects")
+          throw new Error("cwdPrefixes requires history=all-projects");
+        const cwdPrefixes = params.cwdPrefixes?.map((prefix) => {
+          if (!isAbsolute(prefix) || prefix.includes("\0")) throw new Error("cwdPrefixes must contain absolute paths");
+          return resolve(prefix);
+        });
+        const normalizedPrefixes = cwdPrefixes ? [...new Set(cwdPrefixes)].sort() : undefined;
         if (params.history !== undefined) {
           if (params.history !== "project" && params.history !== "all-projects") throw new Error("history must be project or all-projects");
           if (action !== "tools") throw new Error("history requires action=tools");
@@ -1181,7 +1199,8 @@ export default function sessionInspector(pi: ExtensionAPI) {
           if (!root) throw new Error("No project session directory is configured");
           const fitted = await inspectHistoricalTools(
             params.history, params.tool, resolve(ctx.cwd, root), resolve(ctx.cwd),
-            params.cursor, params.sessionLimit ?? 25, limit, params.includeArguments ? maxChars : undefined, signal,
+            params.cursor, params.sessionLimit ?? 25, limit, params.includeArguments ? maxChars : undefined,
+            normalizedPrefixes, signal,
           );
           return {
             content: [{ type: "text", text: JSON.stringify(fitted) }],
